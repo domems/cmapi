@@ -1,11 +1,8 @@
 // src/controllers/minersController.js
 import { sql } from "../config/db.js";
+import crypto from "crypto";
 
 /* ===================== Helpers ===================== */
-
-const adminEmails = ["domems@gmail.com", "admin2@email.com"].map((e) =>
-  String(e).trim().toLowerCase()
-);
 
 function parseBool(v) {
   if (v === undefined) return undefined;
@@ -24,7 +21,6 @@ function normalizeDecimal(input) {
     return input;
   }
   const s0 = String(input).trim().replace(/\s+/g, "");
-  // aceita "1.234,56" ou "1,234.56"
   let s = s0;
   const hasComma = s.includes(",");
   const hasDot   = s.includes(".");
@@ -42,6 +38,16 @@ function normalizeDecimal(input) {
   return n;
 }
 
+/* ===================== Cache de listagem ===================== */
+
+const listCache = new Map(); // key: userId -> { bodyJson, etag, expiresAt }
+const LIST_TTL_MS = 10_000; // 10s
+
+function makeEtag(payloadString) {
+  const hash = crypto.createHash("sha1").update(payloadString).digest("base64");
+  return `W/"${hash}"`; // weak ETag
+}
+
 /* ===================== Criar ===================== */
 
 export const criarMiner = async (req, res) => {
@@ -57,7 +63,7 @@ export const criarMiner = async (req, res) => {
     secret_key,
     coin,
     pool,
-    locked, // opcional no body; default = true
+    locked, // opcional; default = true
   } = req.body || {};
 
   try {
@@ -100,6 +106,10 @@ export const criarMiner = async (req, res) => {
       )
       RETURNING *;
     `;
+
+    // invalida cache da listagem do utilizador
+    listCache.delete(String(user_id));
+
     res.status(201).json(novoMiner);
   } catch (err) {
     console.error("Erro ao criar miner:", err);
@@ -107,16 +117,15 @@ export const criarMiner = async (req, res) => {
   }
 };
 
-/* ========== Atualização por cliente (apenas campos do cliente) ========== */
-/* Regra: se locked=true → 423 Locked (não altera). Para Binance exige api+secret. */
+/* ========== Atualização por cliente (campos do cliente) ========== */
+/* Regra: se locked=true → 423 Locked. Para Binance exige api+secret. */
 export const atualizarMinerComoCliente = async (req, res) => {
   const { id } = req.params;
   const { worker_name, api_key, secret_key, coin, pool } = req.body || {};
 
   try {
-    // estado atual
     const [curr] = await sql`
-      SELECT id, locked, worker_name AS w, api_key AS a, secret_key AS s, coin AS c, pool AS p
+      SELECT id, user_id, locked, worker_name AS w, api_key AS a, secret_key AS s, coin AS c, pool AS p
       FROM miners
       WHERE id = ${id}
       LIMIT 1
@@ -131,7 +140,7 @@ export const atualizarMinerComoCliente = async (req, res) => {
     const finalApi  = api_key !== undefined ? api_key : curr.a;
     const finalSec  = secret_key !== undefined ? secret_key : curr.s;
 
-    if (finalPool === "Binance" && (!finalApi || !finalSec)) {
+    if (String(finalPool).toLowerCase() === "binance" && (!finalApi || !finalSec)) {
       return res.status(400).json({ error: "Para Binance, api_key e secret_key são obrigatórias." });
     }
 
@@ -147,6 +156,10 @@ export const atualizarMinerComoCliente = async (req, res) => {
       WHERE id = ${id}
       RETURNING *;
     `;
+
+    // invalida cache da listagem do utilizador dono
+    if (updatedMiner?.user_id) listCache.delete(String(updatedMiner.user_id));
+
     res.json(updatedMiner);
   } catch (err) {
     console.error("Erro ao atualizar miner (cliente):", err);
@@ -154,66 +167,7 @@ export const atualizarMinerComoCliente = async (req, res) => {
   }
 };
 
-/* ========== Atualização por admin (campos técnicos) ========== */
-/* Adiciona capacidade de alterar 'locked' (true/false) */
-export const atualizarMinerComoAdmin = async (req, res) => {
-  const { id } = req.params;
-  const userEmail = String(req.header("x-user-email") || "").toLowerCase();
-
-  if (!adminEmails.includes(userEmail)) {
-    return res.status(403).json({ error: "Acesso negado. Apenas admins podem editar." });
-  }
-
-  let { nome, modelo, hash_rate, preco_kw, consumo_kw_hora, locked } = req.body || {};
-
-  try {
-    // nome: se enviado, não pode ser vazio (coluna NOT NULL)
-    if (nome !== undefined) {
-      const clean = String(nome).trim();
-      if (!clean) return res.status(400).json({ error: "Campo 'nome' não pode ser vazio." });
-      nome = clean;
-    }
-
-    // modelo: string vazia -> NULL; senão mantém/atualiza
-    if (modelo !== undefined) {
-      modelo = String(modelo).trim() || null;
-    }
-
-    // Decimais
-    try {
-      if (hash_rate !== undefined) hash_rate = normalizeDecimal(hash_rate);
-      if (preco_kw !== undefined)  preco_kw  = normalizeDecimal(preco_kw);
-      if (consumo_kw_hora !== undefined) consumo_kw_hora = normalizeDecimal(consumo_kw_hora);
-    } catch (e) {
-      return res.status(400).json({ error: String(e.message || e) });
-    }
-
-    // locked (boolean)
-    const lockedParsed = parseBool(locked);
-    // undefined => não mexe; null => limpa (mas não faz sentido limpar bool) -> ignoramos
-
-    const [updatedMiner] = await sql`
-      UPDATE miners
-      SET
-        nome             = COALESCE(${nome ?? null}, nome),
-        modelo           = COALESCE(${modelo ?? null}, modelo),
-        hash_rate        = COALESCE(${hash_rate ?? null}, hash_rate),
-        preco_kw         = COALESCE(${preco_kw ?? null}, preco_kw),
-        consumo_kw_hora  = COALESCE(${consumo_kw_hora ?? null}, consumo_kw_hora),
-        locked           = COALESCE(${lockedParsed}, locked),
-        updated_at       = NOW()
-      WHERE id = ${id}
-      RETURNING *;
-    `;
-
-    res.json(updatedMiner);
-  } catch (err) {
-    console.error("Erro ao atualizar miner (admin):", err);
-    res.status(500).json({ error: "Erro ao atualizar miner (admin)" });
-  }
-};
-
-/* ===================== Ler/Listar ===================== */
+/* ===================== Ler ===================== */
 
 export const obterMinerPorId = async (req, res) => {
   const { id } = req.params;
@@ -227,15 +181,49 @@ export const obterMinerPorId = async (req, res) => {
   }
 };
 
+/**
+ * Listar miners por utilizador, com cache 10s + ETag (304 Not Modified).
+ * Alivia o DB e elimina 429 do teu frontend.
+ */
 export const listarMinersPorUser = async (req, res) => {
   const { userId } = req.params;
+  const now = Date.now();
+
   try {
+    const cached = listCache.get(String(userId));
+    if (cached && cached.expiresAt > now) {
+      const inm = req.headers["if-none-match"];
+      if (inm && inm === cached.etag) {
+        res.status(304).end();
+        return;
+      }
+      res.setHeader("ETag", cached.etag);
+      res.setHeader("Cache-Control", "public, max-age=10");
+      res.json(cached.bodyJson);
+      return;
+    }
+
     const miners = await sql`
       SELECT * FROM miners
       WHERE user_id = ${userId}
       ORDER BY created_at DESC;
     `;
-    res.json(miners);
+
+    const bodyJson = miners;
+    const raw = JSON.stringify(bodyJson);
+    const etag = makeEtag(raw);
+
+    listCache.set(String(userId), { bodyJson, etag, expiresAt: now + LIST_TTL_MS });
+
+    const inm = req.headers["if-none-match"];
+    if (inm && inm === etag) {
+      res.status(304).end();
+      return;
+    }
+
+    res.setHeader("ETag", etag);
+    res.setHeader("Cache-Control", "public, max-age=10");
+    res.json(bodyJson);
   } catch (err) {
     console.error("Erro ao listar miners:", err);
     res.status(500).json({ error: "Erro ao buscar miners" });
@@ -260,6 +248,10 @@ export const atualizarStatusMiner = async (req, res) => {
       WHERE id = ${id}
       RETURNING *;
     `;
+
+    // invalida cache do dono
+    if (updatedMiner?.user_id) listCache.delete(String(updatedMiner.user_id));
+
     res.json(updatedMiner);
   } catch (err) {
     console.error("Erro ao atualizar status:", err);
@@ -270,7 +262,10 @@ export const atualizarStatusMiner = async (req, res) => {
 export const apagarMiner = async (req, res) => {
   const { id } = req.params;
   try {
+    // precisamos do user_id para invalidar o cache
+    const [curr] = await sql`SELECT user_id FROM miners WHERE id = ${id} LIMIT 1`;
     await sql`DELETE FROM miners WHERE id = ${id}`;
+    if (curr?.user_id) listCache.delete(String(curr.user_id));
     res.status(204).send();
   } catch (err) {
     console.error("Erro ao apagar miner:", err);
