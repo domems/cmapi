@@ -1,5 +1,6 @@
 // src/detectors/stateDetector.js
 import { sql } from "../config/db.js";
+
 const asRows = (res) => (Array.isArray(res) ? res : (res?.rows ?? []));
 
 /** Canonical: ONLINE | OFFLINE | STALE */
@@ -20,7 +21,7 @@ function slotISO(d = new Date()) {
 }
 
 async function getCurrentState(minerId) {
-  const r = asRows(await sql`
+  const r = asRows(await sql/*sql*/`
     SELECT current_state, stable_since_utc, last_seen_utc, last_hashrate
     FROM miner_state
     WHERE miner_id = ${minerId}
@@ -28,9 +29,29 @@ async function getCurrentState(minerId) {
   return r[0] || null;
 }
 
+/** Check user prefs for given template. Default = ON if not set. */
+async function userWants(template, userId) {
+  // Keys in user_notification_prefs:
+  //  - miner_status_offline
+  //  - miner_status_online
+  const key =
+    template === "miner_offline"   ? "miner_status_offline" :
+    template === "miner_recovered" ? "miner_status_online"  :
+    template;
+
+  const rows = await sql/*sql*/`
+    SELECT enabled
+    FROM user_notification_prefs
+    WHERE user_id = ${userId} AND key = ${key}
+    LIMIT 1
+  `;
+  if (!rows.length) return true; // default ON
+  return !!rows[0].enabled;
+}
+
 export async function processMiner(minerId) {
-  // status + dono + worker
-  const minerRows = asRows(await sql`
+  // status + owner + worker
+  const minerRows = asRows(await sql/*sql*/`
     SELECT id, status, user_id, worker_name
     FROM miners
     WHERE id = ${minerId}
@@ -45,9 +66,9 @@ export async function processMiner(minerId) {
   const now = new Date();
   const sISO = slotISO(now);
 
-  // Primeira vez: sem evento; só semear
+  // First time: seed only, no event
   if (!prev) {
-    await sql`
+    await sql/*sql*/`
       INSERT INTO miner_state (miner_id, current_state, stable_since_utc, last_change_utc, last_seen_utc, last_hashrate, flap_count)
       VALUES (${minerId}, ${next}, ${now}, ${now}, ${now}, 0, 0)
       ON CONFLICT (miner_id) DO UPDATE
@@ -59,25 +80,26 @@ export async function processMiner(minerId) {
     return { changed: false, from: null, to: next };
   }
 
+  // No change: just heartbeat
   if (prev === next) {
-    await sql`UPDATE miner_state SET last_seen_utc = ${now} WHERE miner_id = ${minerId}`;
+    await sql/*sql*/`UPDATE miner_state SET last_seen_utc = ${now} WHERE miner_id = ${minerId}`;
     return { changed: false, from: prev, to: next };
   }
 
-  // Mudou → evento + update + outbox
+  // Changed → event + update + outbox (with prefs)
   const shouldNotifyUser =
     (prev !== "OFFLINE" && next === "OFFLINE") ||
     (prev !== "ONLINE"  && next === "ONLINE");
 
-  // 1) evento
-  await sql`
+  // 1) event
+  await sql/*sql*/`
     INSERT INTO miner_state_events (miner_id, from_state, to_state, slot_iso, reason)
     VALUES (${minerId}, ${prev}, ${next}, ${sISO}, ${prev}||'→'||${next})
     ON CONFLICT DO NOTHING
   `;
 
-  // 2) estado atual
-  await sql`
+  // 2) current state
+  await sql/*sql*/`
     UPDATE miner_state
     SET current_state    = ${next},
         last_change_utc  = ${now},
@@ -86,14 +108,14 @@ export async function processMiner(minerId) {
     WHERE miner_id = ${minerId}
   `;
 
-  // 3) notificações
+  // 3) notifications (respect prefs)
   if (shouldNotifyUser) {
     const template = next === "OFFLINE" ? "miner_offline" : "miner_recovered";
-    const baseKey = `miner:${minerId}:${prev}->${next}:${sISO}`;
-    const inappKey = baseKey;                  // dedupe para in-app
-    const pushKey  = `${baseKey}:push`;        // dedupe separado para push
-    const adminKey = `${baseKey}:role:admin:push`;
-    const supportKey = `${baseKey}:role:support:push`;
+    const baseKey   = `miner:${minerId}:${prev}->${next}:${sISO}`;
+    const inappKey  = baseKey;                   // dedupe for in-app
+    const pushKey   = `${baseKey}:push`;         // separate dedupe for push
+    const adminKey  = `${baseKey}:role:admin:push`;
+    const supportKey= `${baseKey}:role:support:push`;
 
     const payload = {
       minerId,
@@ -104,32 +126,38 @@ export async function processMiner(minerId) {
       atUtc: now.toISOString()
     };
 
-    // Dono (inapp + push)
-    await sql`
+    // Check user prefs for push
+    const wants = await userWants(template, miner.user_id);
+
+    // Owner: in-app always (optional: comment out if you only want push)
+    await sql/*sql*/`
       INSERT INTO notification_outbox
         (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
       VALUES
         (${inappKey}, 'user', ${miner.user_id}, 'inapp', ${template}, ${JSON.stringify(payload)}::jsonb)
       ON CONFLICT (dedupe_key) DO NOTHING
     `;
-    await sql`
-      INSERT INTO notification_outbox
-        (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
-      VALUES
-        (${pushKey}, 'user', ${miner.user_id}, 'push', ${template}, ${JSON.stringify(payload)}::jsonb)
-      ON CONFLICT (dedupe_key) DO NOTHING
-    `;
 
-    // Escalação só para OFFLINE (roles)
+    if (wants) {
+      await sql/*sql*/`
+        INSERT INTO notification_outbox
+          (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
+        VALUES
+          (${pushKey}, 'user', ${miner.user_id}, 'push', ${template}, ${JSON.stringify(payload)}::jsonb)
+        ON CONFLICT (dedupe_key) DO NOTHING
+      `;
+    }
+
+    // Escalation only for OFFLINE (roles)
     if (next === "OFFLINE") {
-      await sql`
+      await sql/*sql*/`
         INSERT INTO notification_outbox
           (dedupe_key, audience_kind, audience_ref, channel, template, payload_json, send_after_utc)
         VALUES
           (${adminKey}, 'role', 'admin', 'push', ${template}, ${JSON.stringify(payload)}::jsonb, NOW() + INTERVAL '60 minutes')
         ON CONFLICT (dedupe_key) DO NOTHING
       `;
-      await sql`
+      await sql/*sql*/`
         INSERT INTO notification_outbox
           (dedupe_key, audience_kind, audience_ref, channel, template, payload_json, send_after_utc)
         VALUES
@@ -137,17 +165,19 @@ export async function processMiner(minerId) {
         ON CONFLICT (dedupe_key) DO NOTHING
       `;
     }
-    // Se recuperou, cancela escalations pendentes (admin/support) e reminders do dono
-    
+
+    // If recovered, kill pending escalations/reminders for this miner
     if (next === "ONLINE") {
-        await sql`
-            UPDATE notification_outbox
-            SET status='dead'
-            WHERE status='pending'
-            AND ( (audience_kind='role' AND channel='push' AND template='miner_offline')
-                OR (audience_kind='user' AND channel='push' AND template='miner_offline_reminder') )
-            AND (payload_json->>'minerId')::bigint = ${minerId}
-        `;
+      await sql/*sql*/`
+        UPDATE notification_outbox
+        SET status='dead'
+        WHERE status='pending'
+          AND (
+                (audience_kind='role' AND channel='push' AND template='miner_offline')
+             OR (audience_kind='user' AND channel='push' AND template='miner_offline_reminder')
+          )
+          AND (payload_json->>'minerId')::bigint = ${minerId}
+      `;
     }
   }
 
@@ -155,7 +185,7 @@ export async function processMiner(minerId) {
 }
 
 export async function detectAllOnce() {
-  const miners = asRows(await sql`SELECT id FROM miners ORDER BY id`);
+  const miners = asRows(await sql/*sql*/`SELECT id FROM miners ORDER BY id`);
   let changed = 0, total = 0;
   for (const m of miners) {
     total++;
