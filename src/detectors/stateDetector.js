@@ -2,13 +2,25 @@
 import { sql } from "../config/db.js";
 const asRows = (res) => (Array.isArray(res) ? res : (res?.rows ?? []));
 
-/** Canonical: ONLINE | OFFLINE | STALE */
+/** Canonical: ONLINE | OFFLINE | MAINTENANCE | STALE */
 function canonicalStateFromStatus(raw) {
   const s = String(raw ?? "").trim().toLowerCase();
-  const ONLINE  = ["online","on","active","ativo","ativa","working","running","normal","ok","up","alive","mining","hashing","ligado"];
-  const OFFLINE = ["offline","off","inactive","inativo","inactiva","down","dead","stopped","error","erro","disabled","paused","fail","ko","desligado"];
-  if (ONLINE.some(k => s.includes(k))) return "ONLINE";
+
+  const ONLINE  = [
+    "online","on","active","working","running","normal","ok","up","alive",
+    "mining","hashing","ligado","ativo","ativa"
+  ];
+  const OFFLINE = [
+    "offline","off","inactive","inativo","inactiva","down","dead","stopped",
+    "error","erro","disabled","paused","fail","ko","desligado"
+  ];
+  const MAINT   = [
+    "maintenance","maint","manutencao","manutenção","service","servicing","repair","upgrading"
+  ];
+
+  if (ONLINE.some(k => s.includes(k)))  return "ONLINE";
   if (OFFLINE.some(k => s.includes(k))) return "OFFLINE";
+  if (MAINT.some(k => s.includes(k)))   return "MAINTENANCE";
   return "STALE";
 }
 
@@ -66,8 +78,9 @@ export async function processMiner(minerId) {
 
   // Mudou → evento + update + outbox
   const shouldNotifyUser =
-    (prev !== "OFFLINE" && next === "OFFLINE") ||
-    (prev !== "ONLINE"  && next === "ONLINE");
+    (prev !== "OFFLINE"     && next === "OFFLINE") ||
+    (prev !== "ONLINE"      && next === "ONLINE")  ||
+    (prev !== "MAINTENANCE" && next === "MAINTENANCE");
 
   // 1) evento
   await sql/*sql*/`
@@ -86,70 +99,47 @@ export async function processMiner(minerId) {
     WHERE miner_id = ${minerId}
   `;
 
-  // 3) notificações (SEM prefs aqui — sempre enfileira)
+  // 3) notificações (só PUSH; in-app removido)
   if (shouldNotifyUser) {
-    const template = next === "OFFLINE" ? "miner_offline" : "miner_recovered";
-    const baseKey    = `miner:${minerId}:${prev}->${next}:${sISO}`;
-    const inappKey   = baseKey;                    // dedupe in-app
-    const pushKey    = `${baseKey}:push`;          // dedupe push
-    const adminKey   = `${baseKey}:role:admin:push`;
-    const supportKey = `${baseKey}:role:support:push`;
+    let template = null;
+    if (next === "OFFLINE")       template = "miner_offline";
+    else if (next === "ONLINE")   template = "miner_recovered";
+    else if (next === "MAINTENANCE") template = "miner_maintenance";
 
-    const payload = {
-      minerId,
-      worker: miner.worker_name || null,
-      from: prev,
-      to: next,
-      slot: sISO,
-      atUtc: now.toISOString()
-    };
+    if (template) {
+      const baseKey  = `miner:${minerId}:${prev}->${next}:${sISO}`;
+      const pushKey  = `${baseKey}:push`;
+      const payload = {
+        minerId: minerId,
+        worker: miner.worker_name || null,
+        from: prev,
+        to: next,
+        slot: sISO,
+        atUtc: now.toISOString()
+      };
 
-    // Dono: enfileira SEMPRE (dispatcher decide entregar ou matar por prefs)
-    await sql/*sql*/`
-      INSERT INTO notification_outbox
-        (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
-      VALUES
-        (${inappKey}, 'user', ${miner.user_id}, 'inapp', ${template}, ${JSON.stringify(payload)}::jsonb)
-      ON CONFLICT (dedupe_key) DO NOTHING
-    `;
-    await sql/*sql*/`
-      INSERT INTO notification_outbox
-        (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
-      VALUES
-        (${pushKey}, 'user', ${miner.user_id}, 'push', ${template}, ${JSON.stringify(payload)}::jsonb)
-      ON CONFLICT (dedupe_key) DO NOTHING
-    `;
-
-    // Escalação só para OFFLINE (fica enfileirada; dispatcher trata)
-    if (next === "OFFLINE") {
+      // Dono (PUSH)
       await sql/*sql*/`
         INSERT INTO notification_outbox
-          (dedupe_key, audience_kind, audience_ref, channel, template, payload_json, send_after_utc)
+          (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
         VALUES
-          (${adminKey}, 'role', 'admin', 'push', ${template}, ${JSON.stringify(payload)}::jsonb, NOW() + INTERVAL '60 minutes')
+          (${pushKey}, 'user', ${miner.user_id}, 'push', ${template}, ${JSON.stringify(payload)}::jsonb)
         ON CONFLICT (dedupe_key) DO NOTHING
       `;
-      await sql/*sql*/`
-        INSERT INTO notification_outbox
-          (dedupe_key, audience_kind, audience_ref, channel, template, payload_json, send_after_utc)
-        VALUES
-          (${supportKey}, 'role', 'support', 'push', ${template}, ${JSON.stringify(payload)}::jsonb, NOW() + INTERVAL '180 minutes')
-        ON CONFLICT (dedupe_key) DO NOTHING
-      `;
-    }
 
-    // Se recuperou, mata escalations/reminders pendentes
-    if (next === "ONLINE") {
-      await sql/*sql*/`
-        UPDATE notification_outbox
-        SET status='dead'
-        WHERE status='pending'
-          AND (
-               (audience_kind='role' AND channel='push' AND template='miner_offline')
-            OR (audience_kind='user' AND channel='push' AND template='miner_offline_reminder')
-          )
-          AND (payload_json->>'minerId')::bigint = ${minerId}
-      `;
+      // Se recuperou, mata escalations/reminders pendentes (inofensivo se não existirem)
+      if (next === "ONLINE") {
+        await sql/*sql*/`
+          UPDATE notification_outbox
+          SET status='dead'
+          WHERE status='pending'
+            AND (
+                 (audience_kind='role' AND channel='push' AND template='miner_offline')
+              OR (audience_kind='user' AND channel='push' AND template='miner_offline_reminder')
+            )
+            AND (payload_json->>'minerId')::bigint = ${minerId}
+        `;
+      }
     }
   }
 
