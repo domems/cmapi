@@ -50,7 +50,7 @@ export function startAllJobs() {
 
   /* ---------- NOTIFICATIONS ---------- */
   safeStart("deliverPush", startDeliverPushLoop);
-  safeStart("deliverInapp", startDeliverInappLoop);
+  //safeStart("deliverInapp", startDeliverInappLoop);
 
   console.log("🟢 Todos os jobs agendados com sucesso.");
 }
