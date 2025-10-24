@@ -5,7 +5,10 @@ import { startUptimeBinance } from "./uptimeBinance.js";
 import { startUptimeF2Pool } from "./uptimeF2Pool.js";
 import { startUptimeMiningDutch } from "./uptimeMiningDutch.js";
 import { startDeliverPushLoop } from "./deliverPush.js";
-import { startDeliverInappLoop } from "./deliverInapp.js";
+import { startDetectStateLoop } from "./detectState.js";
+
+
+
 
 let started = false;
 
@@ -50,6 +53,7 @@ export function startAllJobs() {
 
   /* ---------- NOTIFICATIONS ---------- */
   safeStart("deliverPush", startDeliverPushLoop);
+  safeStart("detectState", startDetectStateLoop);
   //safeStart("deliverInapp", startDeliverInappLoop);
 
   console.log("🟢 Todos os jobs agendados com sucesso.");
