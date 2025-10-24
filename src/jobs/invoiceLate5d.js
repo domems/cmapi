@@ -13,7 +13,7 @@ export async function runInvoiceLate5dOnce() {
   const rows = await sql/*sql*/`
     SELECT id, user_id, year, month, subtotal_amount, currency_code, created_at
     FROM energy_invoices
-    WHERE status <> 'paid'
+    WHERE status <> 'pago'
       AND created_at <= NOW() - INTERVAL '5 days'
   `;
 
