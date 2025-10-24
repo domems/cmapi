@@ -6,7 +6,6 @@ import { startUptimeF2Pool } from "./uptimeF2Pool.js";
 import { startUptimeMiningDutch } from "./uptimeMiningDutch.js";
 import { startDeliverPushLoop } from "./deliverPush.js";
 import { startDeliverInappLoop } from "./deliverInapp.js";
-import { startOfflineReminderLoop } from "./offlineReminder.js";
 
 let started = false;
 
@@ -52,7 +51,6 @@ export function startAllJobs() {
   /* ---------- NOTIFICATIONS ---------- */
   safeStart("deliverPush", startDeliverPushLoop);
   safeStart("deliverInapp", startDeliverInappLoop);
-  safeStart("offlineReminder", startOfflineReminderLoop);
 
   console.log("🟢 Todos os jobs agendados com sucesso.");
 }
