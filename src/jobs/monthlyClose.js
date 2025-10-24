@@ -29,6 +29,29 @@ async function getOrCreateInvoiceId(userId, year, month) {
   return inserted[0]?.id;
 }
 
+async function enqueueInvoiceClosed(userId, invoiceId, year, month, subtotal, currency = "USD") {
+  const mm = String(month).padStart(2, "0");
+  const dedupe = `invoice:${userId}:${year}-${mm}:closed`;
+
+  const payload = {
+    invoiceId,
+    year,
+    month,
+    subtotal,
+    currency,
+    atUtc: new Date().toISOString(),
+  };
+
+  // Enfileira push; deliverPush trata das prefs (invoice_closed)
+  await sql/*sql*/`
+    INSERT INTO notification_outbox
+      (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
+    VALUES
+      (${dedupe}, 'user', ${userId}, 'push', 'invoice_closed', ${JSON.stringify(payload)}::jsonb)
+    ON CONFLICT (dedupe_key) DO NOTHING
+  `;
+}
+
 async function closeMonthOnce(year, month) {
   const today = new Date();
   const lockKey = `monthly-close:${year}-${String(month).padStart(2, "0")}-${today.getDate()}`;
@@ -114,6 +137,9 @@ async function closeMonthOnce(year, month) {
       UPDATE miners SET total_horas_online = 0 WHERE user_id = ${userId}
     `;
 
+    // 🔔 Enfileira notificação de fecho (end of month)
+    await enqueueInvoiceClosed(userId, invoiceId, year, month, +subtotal.toFixed(2), "USD");
+
     console.log(`✅ Fecho mensal user=${userId} total=${subtotal} USD`);
   }
 
@@ -122,7 +148,7 @@ async function closeMonthOnce(year, month) {
 
 export function startMonthlyClose() {
   cron.schedule(
-    "05 00 1 * *", // dia 1 às 17:45
+    "05 00 1 * *",
     async () => {
       try {
         const { year, month } = previousMonthLisbon();
