@@ -1,11 +1,10 @@
-// src/jobs/uptimeF2Pool.js
 import cron from "node-cron";
 import fetch from "node-fetch";
 import dns from "dns";
 import { sql } from "../config/db.js";
 import { redis } from "../config/upstash.js";
 
-/* ===== limpar proxies marados e forçar IPv4-first ===== */
+/* ===== limpar proxies e forçar IPv4-first ===== */
 for (const k of ["HTTP_PROXY","http_proxy","HTTPS_PROXY","https_proxy","NO_PROXY","no_proxy"]) {
   if (process.env[k]) { console.warn(`[uptime:f2pool] ignorando ${k}=${process.env[k]}`); delete process.env[k]; }
 }
@@ -27,17 +26,18 @@ function splitAccountWorker(row) {
 }
 function tail(s) { const str = clean(s); const i = str.lastIndexOf("."); return i >= 0 ? str.slice(i + 1) : str; }
 const workerKey = (w) => { const s = clean(w).toLowerCase(); const k = s.replace(/^0+/, ""); return k === "" ? "0" : k; };
+
 function f2slug(coin) {
   const c = String(coin ?? "").trim().toUpperCase();
-  if (c === "BTC" || c === "BITCOIN") return "bitcoin";
+  if (c === "BTC") return "bitcoin";
   if (c === "BCH") return "bitcoin-cash";
   if (c === "BSV") return "bitcoin-sv";
-  if (c === "LTC" || c === "LITECOIN") return "litecoin";
-  if (c === "KAS" || c === "KASPA") return "kaspa";
+  if (c === "LTC") return "litecoin";
+  if (c === "KAS") return "kaspa";
   if (c === "CFX") return "conflux";
   if (c === "ETC") return "ethereum-classic";
   if (c === "DASH") return "dash";
-  if (c === "SC" || c === "SIA") return "sia";
+  if (c === "SC") return "sia";
   return c.toLowerCase();
 }
 
@@ -78,7 +78,7 @@ function normalizeV2Workers(list) {
   return out;
 }
 
-/* ===== F2Pool v2 (token em miners.api_key) — BTC -> "bitcoin" ===== */
+/* ===== F2Pool v2 (token em miners.api_key) ===== */
 async function f2poolV2Workers(account, coin, token) {
   if (!token) return { ok: false, status: 0, workers: [], endpoint: null, reason: "no_token" };
   const url = "https://api.f2pool.com/v2/hash_rate/worker/list";
@@ -108,6 +108,9 @@ let lastSlot = null;
 const updatedInSlot = new Set();
 function beginSlot(s) { if (s !== lastSlot) { lastSlot = s; updatedInSlot.clear(); } }
 function dedupeForHours(ids) { const out = []; for (const id of ids) if (!updatedInSlot.has(id)) { updatedInSlot.add(id); out.push(id); } return out; }
+
+/* ===== Bloqueio manutenção (status DB) ===== */
+const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
 
 /* ===== Job ===== */
 export async function runUptimeF2PoolOnce() {
@@ -182,7 +185,7 @@ export async function runUptimeF2PoolOnce() {
           if (!suffixToIds.has(sufNorm)) continue;
 
           const hrOnline = Number(w.hr) > 0;
-          const statusOnline = Number(w.statusCode) === 0;     // 0 = online (F2Pool v2)
+          const statusOnline = Number(w.statusCode) === 0;     // 0 = online
           const definitelyOffline = Number(w.statusCode) === 1 && !hrOnline;
 
           if (hrOnline || statusOnline) onlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
@@ -190,25 +193,27 @@ export async function runUptimeF2PoolOnce() {
           if (definitelyOffline) offlineIdsRaw.push(...(suffixToIds.get(sufNorm) || []));
         }
 
-        // 1) horas online (dedupe slot) — SÓ hr>0
+        // 1) horas online (dedupe slot) — NÃO contar se em manutenção
         const onlineIdsForHours = dedupeForHours(onlineIdsForHoursRaw);
         if (onlineIdsForHours.length) {
           const r = await sql/*sql*/`
             UPDATE miners
             SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
             WHERE id = ANY(${onlineIdsForHours})
+              ${IS_NOT_MAINT}
             RETURNING id
           `;
           hoursUpdated += (Array.isArray(r) ? r.length : (r?.count || 0));
         }
 
-        // 2) status visível
+        // 2) status (IGNORAR manutenção)
         if (onlineIdsRaw.length) {
           const r1 = await sql/*sql*/`
             UPDATE miners
             SET status = 'online'
             WHERE id = ANY(${onlineIdsRaw})
               AND status IS DISTINCT FROM 'online'
+              ${IS_NOT_MAINT}
             RETURNING id
           `;
           statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
@@ -219,6 +224,7 @@ export async function runUptimeF2PoolOnce() {
             SET status = 'offline'
             WHERE id = ANY(${offlineIdsRaw})
               AND status IS DISTINCT FROM 'offline'
+              ${IS_NOT_MAINT}
             RETURNING id
           `;
           statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));

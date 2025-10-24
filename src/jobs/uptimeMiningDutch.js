@@ -62,7 +62,7 @@ function isOnlineFromWorker(w) {
 function parseWorkersPayload(data) {
   if (!data || typeof data !== "object") return null;
 
-  // 1) formato com chave topo "getuserworkers" (o teu log)
+  // 1) formato com chave topo "getuserworkers"
   if (data.getuserworkers && data.getuserworkers.data) {
     const miners = data.getuserworkers.data.miners || data.getuserworkers.data.workers || [];
     if (Array.isArray(miners)) {
@@ -87,7 +87,7 @@ function parseWorkersPayload(data) {
     }
   }
 
-  // 2) formatos genéricos que tentámos antes
+  // 2) formatos alternativos
   const node = data?.data?.workers ?? data?.workers ?? data?.data ?? null;
   if (node && typeof node === "object" && !Array.isArray(node)) {
     return Object.entries(node).map(([k, v]) => ({
@@ -161,6 +161,9 @@ function dedupeForHours(ids) {
   return out;
 }
 
+/* ===== bloquear writes quando status já é 'maintenance' ===== */
+const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
+
 /* ===== job principal ===== */
 export async function runUptimeMiningDutchOnce() {
   const sISO = slotISO();
@@ -187,8 +190,7 @@ export async function runUptimeMiningDutchOnce() {
     `;
     if (!miners.length) return { ok: true, updated: 0, statusChanged: 0 };
 
-    // IMPORTANTE: se alteraste o worker_name na BD para "ACCOUNT_ID.tail" (p.ex. "241903.001"),
-    // o head() dá o account_id correto, e o tail() continua a ser o "001".
+    // group by api_key + account_id (head(worker_name)) + coin
     const groups = new Map();
     for (const m of miners) {
       const account_id = head(m.worker_name);
@@ -205,7 +207,7 @@ export async function runUptimeMiningDutchOnce() {
       try {
         const workers = await fetchMiningDutchWorkers({ coin, account_id, api_key });
 
-        // index por tail (lowercase). Mining-Dutch usa "username" como tail (ex.: "001")
+        // index por tail (lowercase)
         const byTail = new Map();
         for (const w of workers) byTail.set(low(tail(w.name) || w.name), w);
 
@@ -221,24 +223,26 @@ export async function runUptimeMiningDutchOnce() {
         for (const m of list) offlineIdsRaw.push(m.id);
       }
 
-      // 1) Horas online (dedupe por slot)
+      // 1) Horas online (dedupe por slot) — NÃO contar se em manutenção
       const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
       if (onlineIdsForHours.length) {
         await sql/*sql*/`
           UPDATE miners
           SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
           WHERE id = ANY(${onlineIdsForHours})
+            ${IS_NOT_MAINT}
         `;
         hoursUpdated += onlineIdsForHours.length;
       }
 
-      // 2) Status (só quando muda)
+      // 2) Status (só quando muda) — IGNORAR manutenção
       if (onlineIdsRaw.length) {
         const r1 = await sql/*sql*/`
           UPDATE miners
           SET status = 'online'
           WHERE id = ANY(${onlineIdsRaw})
             AND status IS DISTINCT FROM 'online'
+            ${IS_NOT_MAINT}
           RETURNING id
         `;
         statusToOnline += Array.isArray(r1) ? r1.length : (r1?.count || 0);
@@ -249,6 +253,7 @@ export async function runUptimeMiningDutchOnce() {
           SET status = 'offline'
           WHERE id = ANY(${offlineIdsRaw})
             AND status IS DISTINCT FROM 'offline'
+            ${IS_NOT_MAINT}
           RETURNING id
         `;
         statusToOffline += Array.isArray(r2) ? r2.length : (r2?.count || 0);

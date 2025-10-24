@@ -1,4 +1,3 @@
-// src/jobs/uptimeBinance.js
 import crypto from "crypto";
 import cron from "node-cron";
 import fetch from "node-fetch";
@@ -147,6 +146,9 @@ function dedupeForHours(ids) {
   return out;
 }
 
+/* ===== Bloqueio manutenção (status DB) ===== */
+const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
+
 /* ===== Job principal ===== */
 export async function runUptimeBinanceOnce() {
   const t0 = Date.now();
@@ -251,24 +253,26 @@ export async function runUptimeBinanceOnce() {
         const onlineSet = new Set(onlineIdsRaw);
         const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
 
-        // 1) Horas online (dedupe por slot)
+        // 1) Horas online (dedupe por slot) — NÃO contar se em manutenção
         const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
         if (onlineIdsForHours.length) {
           await sql/*sql*/`
             UPDATE miners
             SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
             WHERE id = ANY(${onlineIdsForHours})
+              ${IS_NOT_MAINT}
           `;
           hoursUpdated += onlineIdsForHours.length;
         }
 
-        // 2) Status (IS DISTINCT FROM para evitar writes inúteis)
+        // 2) Status (IGNORAR manutenção)
         if (onlineIdsRaw.length) {
           const r1 = await sql/*sql*/`
             UPDATE miners
             SET status = 'online'
             WHERE id = ANY(${onlineIdsRaw})
               AND status IS DISTINCT FROM 'online'
+              ${IS_NOT_MAINT}
             RETURNING id
           `;
           statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
@@ -279,6 +283,7 @@ export async function runUptimeBinanceOnce() {
             SET status = 'offline'
             WHERE id = ANY(${offlineIdsRaw})
               AND status IS DISTINCT FROM 'offline'
+              ${IS_NOT_MAINT}
             RETURNING id
           `;
           statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));

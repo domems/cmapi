@@ -31,6 +31,9 @@ function dedupeForHours(ids) {
   return out;
 }
 
+/* ===== Bloqueio manutenção (status DB) ===== */
+const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
+
 export async function runUptimeLTCPoolOnce() {
   const sISO = slotISO();
   beginSlot(sISO);
@@ -83,36 +86,37 @@ export async function runUptimeLTCPoolOnce() {
         console.error("[uptime:ltcpool] erro grupo", apiKey, e);
       }
 
-      // 1) Horas online (dedupe por slot para não contar a dobrar)
+      // 1) Horas online (dedupe por slot) — NÃO contar se em manutenção
       const onlineIdsForHours = dedupeForHours(onlineIdsRaw);
       if (onlineIdsForHours.length) {
         await sql/*sql*/`
           UPDATE miners
           SET total_horas_online = COALESCE(total_horas_online, 0) + 0.25
           WHERE id = ANY(${onlineIdsForHours})
+            ${IS_NOT_MAINT}
         `;
         hoursUpdated += onlineIdsForHours.length;
       }
 
-      // 2) Status (só altera quando diverge — evita writes desnecessários)
-      // online
+      // 2) Status (IGNORAR manutenção)
       if (onlineIdsRaw.length) {
         const r1 = await sql/*sql*/`
           UPDATE miners
           SET status = 'online'
           WHERE id = ANY(${onlineIdsRaw})
             AND status IS DISTINCT FROM 'online'
+            ${IS_NOT_MAINT}
           RETURNING id
         `;
         statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
       }
-      // offline
       if (offlineIdsRaw.length) {
         const r2 = await sql/*sql*/`
           UPDATE miners
           SET status = 'offline'
           WHERE id = ANY(${offlineIdsRaw})
             AND status IS DISTINCT FROM 'offline'
+            ${IS_NOT_MAINT}
           RETURNING id
         `;
         statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));
@@ -122,7 +126,7 @@ export async function runUptimeLTCPoolOnce() {
     }
 
     const statusChanged = statusToOnline + statusToOffline;
-    console.log(`[uptime:ltcpool] ${sISO} – horas+ para: ${hoursUpdated}, status->online: ${statusToOnline}, status->offline: ${statusToOffline}`);
+    console.log(`[uptime:ltcpool] ${sISO} – horas+: ${hoursUpdated}, status->online: ${statusToOnline}, status->offline: ${statusToOffline}`);
     return { ok: true, updated: hoursUpdated, statusChanged };
   } catch (e) {
     console.error("⛔ uptime:ltcpool", e);

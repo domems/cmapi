@@ -96,6 +96,9 @@ async function getViaBTCWorkersCached(apiKey, coin, slot) {
   return { workers, cache: "miss" };
 }
 
+/* ===== Bloqueio manutenção (status DB) ===== */
+const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
+
 // ===== Job principal =====
 export async function runUptimeViaBTCOnce() {
   const t0 = Date.now();
@@ -187,24 +190,26 @@ export async function runUptimeViaBTCOnce() {
         const onlineSet = new Set(onlineIdsRaw);
         const offlineIdsRaw = allIds.filter(id => !onlineSet.has(id));
 
-        // 1) Horas online (dedupe por slot para não contar a dobrar)
+        // 1) Horas online (dedupe por slot) — NÃO contar se em manutenção
         const ids = dedupe(onlineIdsRaw);
         if (ids.length) {
           await sql/*sql*/`
             UPDATE miners
             SET total_horas_online = COALESCE(total_horas_online,0) + 0.25
             WHERE id = ANY(${ids})
+              ${IS_NOT_MAINT}
           `;
           updated += ids.length;
         }
 
-        // 2) Status (só altera quando diverge — null-safe com IS DISTINCT FROM)
+        // 2) Status (IGNORAR manutenção; só altera quando diverge)
         if (onlineIdsRaw.length) {
           const r1 = await sql/*sql*/`
             UPDATE miners
             SET status = 'online'
             WHERE id = ANY(${onlineIdsRaw})
               AND status IS DISTINCT FROM 'online'
+              ${IS_NOT_MAINT}
             RETURNING id
           `;
           statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
@@ -215,6 +220,7 @@ export async function runUptimeViaBTCOnce() {
             SET status = 'offline'
             WHERE id = ANY(${offlineIdsRaw})
               AND status IS DISTINCT FROM 'offline'
+              ${IS_NOT_MAINT}
             RETURNING id
           `;
           statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));
@@ -230,7 +236,7 @@ export async function runUptimeViaBTCOnce() {
       queue.push(p);
       if (queue.length >= CONCURRENCY) {
         await Promise.race(queue).catch(() => {});
-        // (nota: manter como está; se quiseres posso trocar para um limitador mais robusto)
+        // mantido: não mexi na tua fila; se quiseres eu limpo resolvidos depois.
       }
     }
     await Promise.allSettled(queue);

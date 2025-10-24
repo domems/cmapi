@@ -97,7 +97,7 @@ export async function runInvoiceLate5dOnce() {
 export function startInvoiceLate5dLoop() {
   // Todos os dias às 17:30 (hora de Lisboa)
   cron.schedule(
-    "05 18 * * *",
+    "00 20 * * *",
     async () => {
       try {
         const r = await runInvoiceLate5dOnce();
