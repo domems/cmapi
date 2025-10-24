@@ -4,25 +4,55 @@ import { startUptimeLTCPool } from "./uptimeLiteCoinPool.js";
 import { startUptimeBinance } from "./uptimeBinance.js";
 import { startUptimeF2Pool } from "./uptimeF2Pool.js";
 import { startUptimeMiningDutch } from "./uptimeMiningDutch.js";
+import { startDeliverPushLoop } from "./deliverPush.js";
+import { startDeliverInappLoop } from "./deliverInapp.js";
+import { startOfflineReminderLoop } from "./offlineReminder.js";
 
 let started = false;
 
+/** Helper para arrancar jobs com logs uniformes */
+function safeStart(name, fn) {
+  try {
+    fn?.();
+    console.log(`✅ [jobs] ${name} started`);
+  } catch (e) {
+    console.error(`❌ [jobs] ${name} failed:`, e);
+  }
+}
+
+/** Ponto único de arranque de todos os jobs */
 export function startAllJobs() {
   if (started) {
-    console.log("[jobs] já iniciado – a ignorar nova chamada.");
+    console.log("[jobs] já iniciado – ignorar nova chamada.");
     return;
   }
   started = true;
 
-  // cada job agenda o seu próprio cron (*/15)
-  try { startUptimeViaBTC(); } catch (e) { console.error("[jobs] ViaBTC falhou:", e); }
-  try { startUptimeLTCPool(); } catch (e) { console.error("[jobs] LiteCoinPool falhou:", e); }
-  try { startUptimeBinance(); } catch (e) { console.error("[jobs] Binance falhou:", e); }
-  try { startUptimeF2Pool(); } catch (e) { console.error("[jobs] F2Pool falhou:", e); }
-  try { startUptimeMiningDutch(); } catch (e) { console.error("[jobs] MiningDutch falhou:", e); }
+  console.log("🚀 Iniciando todos os jobs...");
 
-  // monthly close (17:33 Europe/Lisbon no próprio ficheiro)
+  /* ---------- UPTIME DETECTION ---------- */
+  safeStart("ViaBTC uptime", startUptimeViaBTC);
+  safeStart("LitecoinPool uptime", startUptimeLTCPool);
+  safeStart("Binance uptime", startUptimeBinance);
+  safeStart("F2Pool uptime", startUptimeF2Pool);
+  safeStart("MiningDutch uptime", startUptimeMiningDutch);
+
+  /* ---------- BILLING / INVOICES ---------- */
   import("./monthlyClose.js")
-    .then(m => m?.startMonthlyClose?.())
-    .catch(() => console.log("[jobs] monthlyClose.js não encontrado (opcional)."));
+    .then((m) => {
+      if (m?.startMonthlyClose) {
+        m.startMonthlyClose();
+        console.log("✅ [jobs] monthlyClose started");
+      } else {
+        console.log("⚠️ [jobs] monthlyClose não exporta startMonthlyClose()");
+      }
+    })
+    .catch(() => console.log("⚠️ [jobs] monthlyClose.js não encontrado (opcional)."));
+
+  /* ---------- NOTIFICATIONS ---------- */
+  safeStart("deliverPush", startDeliverPushLoop);
+  safeStart("deliverInapp", startDeliverInappLoop);
+  safeStart("offlineReminder", startOfflineReminderLoop);
+
+  console.log("🟢 Todos os jobs agendados com sucesso.");
 }
