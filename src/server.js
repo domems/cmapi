@@ -1,3 +1,4 @@
+// src/server.js
 import express from "express";
 import dotenv from "dotenv";
 import { sql } from "./config/db.js";
@@ -63,7 +64,7 @@ console.log("my port:", process.env.PORT);
 // ✅ Cria/actualiza tabela conforme o teu schema real
 async function initDB() {
   try {
-    // cria a tabela se não existir (com as colunas principais)
+    // ======= Tua tabela miners (mantido) =======
     await sql/*sql*/`
       CREATE TABLE IF NOT EXISTS miners (
         id SERIAL PRIMARY KEY,
@@ -83,15 +84,28 @@ async function initDB() {
         pool TEXT
       );
     `;
-
-    // garante defaults/colunas caso a tabela já existisse noutro formato
     await sql/*sql*/`
       ALTER TABLE miners
         ALTER COLUMN status SET DEFAULT 'offline';
     `;
     await sql/*sql*/`ALTER TABLE miners DROP COLUMN IF EXISTS data_registo;`;
 
-    console.log("✅ DB pronta (tabelas e colunas verificadas).");
+    // ======= NOVA: Tabela de push tokens =======
+    await sql/*sql*/`
+      CREATE TABLE IF NOT EXISTS push_tokens (
+        id BIGSERIAL PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        token TEXT NOT NULL UNIQUE,
+        platform TEXT,
+        app_version TEXT,
+        last_seen TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `;
+    await sql/*sql*/`
+      CREATE INDEX IF NOT EXISTS push_tokens_user_id_idx ON push_tokens(user_id);
+    `;
+
+    console.log("✅ DB pronta (miners & push_tokens).");
   } catch (err) {
     console.error("❌ Erro ao preparar a DB:", err);
     process.exit(1);
