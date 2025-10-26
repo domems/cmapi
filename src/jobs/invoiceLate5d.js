@@ -1,6 +1,7 @@
 // src/jobs/invoiceLate5d.js
 import cron from "node-cron";
 import { sql } from "../config/db.js";
+import { buildPushFromTemplate } from "../services/notificationTemplates.js";
 
 const TZ = "Europe/Lisbon";
 
@@ -10,10 +11,7 @@ const TZ = "Europe/Lisbon";
  */
 const PAID_STATES = ["pago", "paga", "paid", "liquidado", "liquidada"];
 
-/**
- * Normaliza o estado (lower/trim).
- * Faz também a checagem de "pago" genérico.
- */
+/** Normaliza o estado (lower/trim). */
 function isPaidStatus(s) {
   if (!s) return false;
   const k = String(s).trim().toLowerCase();
@@ -25,22 +23,22 @@ function isPaidStatus(s) {
  * Usa created_at como "data de fecho", como pediste.
  */
 async function fetchOverdueInvoices() {
-  // Traz todas as candidatas; filtramos os sinónimos de "pago" em SQL E por segurança em JS
+  // Filtra em SQL (mais eficiente) e volta a validar em JS por segurança.
   const rows = await sql/*sql*/`
     SELECT id, user_id, year, month, subtotal_amount, currency_code, created_at, status
     FROM energy_invoices
     WHERE created_at <= NOW() - INTERVAL '5 days'
+      AND NOT (lower(status) = ANY(${sql.array(PAID_STATES, 'text')}))
   `;
   return rows.filter((r) => !isPaidStatus(r.status));
 }
 
-/**
- * Devolve chave YYYY-MM-DD segundo a timezone de Lisboa,
- * para dedupe consistente com a hora do cron.
- */
+/** Devolve chave YYYY-MM-DD segundo a timezone de Lisboa. */
 async function getLisbonDayKey() {
-  const d = await sql/*sql*/`SELECT to_char((NOW() AT TIME ZONE 'Europe/Lisbon')::date, 'YYYY-MM-DD') AS d`;
-  return d?.[0]?.d || new Date().toISOString().slice(0, 10);
+  const r = await sql/*sql*/`
+    SELECT to_char((NOW() AT TIME ZONE ${TZ})::date, 'YYYY-MM-DD') AS d
+  `;
+  return r?.[0]?.d || new Date().toISOString().slice(0, 10);
 }
 
 export async function runInvoiceLate5dOnce() {
@@ -60,8 +58,10 @@ export async function runInvoiceLate5dOnce() {
   let totalInvoices = 0;
 
   for (const [userId, list] of byUser.entries()) {
-    // 1 push/dia/UTILIZADOR (leva lista de invoices no payload)
-    const dedupe = `invoice:late5d:user:${userId}:${dayKey}`;
+    // 1 conjunto/dia/UTILIZADOR (payload contém as invoices)
+    const baseDedupe = `invoice:late5d:user:${userId}:${dayKey}`;
+    const pushKey    = `${baseDedupe}:push`;
+    const inappKey   = `${baseDedupe}:inapp`;
 
     // Ordena por data, só por estética
     list.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
@@ -79,11 +79,22 @@ export async function runInvoiceLate5dOnce() {
       atUtc: new Date().toISOString(),
     };
 
+    // 🔔 PUSH (como já fazias)
     await sql/*sql*/`
       INSERT INTO notification_outbox
         (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
       VALUES
-        (${dedupe}, 'user', ${userId}, 'push', 'invoice_late_5d', ${JSON.stringify(payload)}::jsonb)
+        (${pushKey}, 'user', ${userId}, 'push', 'invoice_late_5d', ${JSON.stringify(payload)}::jsonb)
+      ON CONFLICT (dedupe_key) DO NOTHING
+    `;
+
+    // 📰 IN-APP (novo): grava já com title/body/data e marca 'sent'
+    const inappPayload = buildPushFromTemplate("invoice_late_5d", payload); // { title, body, data }
+    await sql/*sql*/`
+      INSERT INTO notification_outbox
+        (dedupe_key, audience_kind, audience_ref, channel, template, payload_json, status, send_after_utc)
+      VALUES
+        (${inappKey}, 'user', ${userId}, 'inapp', 'invoice_late_5d', ${JSON.stringify(inappPayload)}::jsonb, 'sent', NOW())
       ON CONFLICT (dedupe_key) DO NOTHING
     `;
 
@@ -97,7 +108,7 @@ export async function runInvoiceLate5dOnce() {
 export function startInvoiceLate5dLoop() {
   // Todos os dias às 17:30 (hora de Lisboa)
   cron.schedule(
-    "00 20 * * *",
+    "30 17 * * *",
     async () => {
       try {
         const r = await runInvoiceLate5dOnce();

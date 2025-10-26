@@ -2,6 +2,7 @@
 import cron from "node-cron";
 import { sql } from "../config/db.js";
 import { redis } from "../config/upstash.js";
+import { buildPushFromTemplate } from "../services/notificationTemplates.js";
 
 const TZ = "Europe/Lisbon";
 const MIN_INVOICE_USD = 15; // valor mínimo para fechar fatura
@@ -29,9 +30,16 @@ async function getOrCreateInvoiceId(userId, year, month) {
   return inserted[0]?.id;
 }
 
+/**
+ * Enfileira notificações de fecho de fatura:
+ *  - PUSH: deliverPush respeita prefs
+ *  - IN-APP: aparece imediatamente no feed (status='sent')
+ */
 async function enqueueInvoiceClosed(userId, invoiceId, year, month, subtotal, currency = "USD") {
   const mm = String(month).padStart(2, "0");
-  const dedupe = `invoice:${userId}:${year}-${mm}:closed`;
+  const base = `invoice:${userId}:${year}-${mm}:closed`;
+  const pushKey  = `${base}:push`;
+  const inappKey = `${base}:inapp`;
 
   const payload = {
     invoiceId,
@@ -42,12 +50,22 @@ async function enqueueInvoiceClosed(userId, invoiceId, year, month, subtotal, cu
     atUtc: new Date().toISOString(),
   };
 
-  // Enfileira push; deliverPush trata das prefs (invoice_closed)
+  // PUSH
   await sql/*sql*/`
     INSERT INTO notification_outbox
       (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
     VALUES
-      (${dedupe}, 'user', ${userId}, 'push', 'invoice_closed', ${JSON.stringify(payload)}::jsonb)
+      (${pushKey}, 'user', ${userId}, 'push', 'invoice_closed', ${JSON.stringify(payload)}::jsonb)
+    ON CONFLICT (dedupe_key) DO NOTHING
+  `;
+
+  // IN-APP (grava já com title/body/data, status sent)
+  const inappPayload = buildPushFromTemplate("invoice_closed", payload); // { title, body, data }
+  await sql/*sql*/`
+    INSERT INTO notification_outbox
+      (dedupe_key, audience_kind, audience_ref, channel, template, payload_json, status, send_after_utc)
+    VALUES
+      (${inappKey}, 'user', ${userId}, 'inapp', 'invoice_closed', ${JSON.stringify(inappPayload)}::jsonb, 'sent', NOW())
     ON CONFLICT (dedupe_key) DO NOTHING
   `;
 }
@@ -137,7 +155,7 @@ async function closeMonthOnce(year, month) {
       UPDATE miners SET total_horas_online = 0 WHERE user_id = ${userId}
     `;
 
-    // 🔔 Enfileira notificação de fecho (end of month)
+    // 🔔 Notificações (push + in-app)
     await enqueueInvoiceClosed(userId, invoiceId, year, month, +subtotal.toFixed(2), "USD");
 
     console.log(`✅ Fecho mensal user=${userId} total=${subtotal} USD`);
@@ -147,6 +165,7 @@ async function closeMonthOnce(year, month) {
 }
 
 export function startMonthlyClose() {
+  // 00:05 do dia 1 de cada mês (hora de Lisboa)
   cron.schedule(
     "05 00 1 * *",
     async () => {

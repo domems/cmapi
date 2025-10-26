@@ -1,5 +1,7 @@
 // src/detectors/stateDetector.js
 import { sql } from "../config/db.js";
+import { buildPushFromTemplate } from "../services/notificationTemplates.js";
+
 const asRows = (res) => (Array.isArray(res) ? res : (res?.rows ?? []));
 
 /** Canonical: ONLINE | OFFLINE | MAINTENANCE | STALE */
@@ -99,16 +101,18 @@ export async function processMiner(minerId) {
     WHERE miner_id = ${minerId}
   `;
 
-  // 3) notificações (só PUSH; in-app removido)
+  // 3) notificações (PUSH + IN-APP)
   if (shouldNotifyUser) {
     let template = null;
-    if (next === "OFFLINE")       template = "miner_offline";
-    else if (next === "ONLINE")   template = "miner_recovered";
+    if (next === "OFFLINE")         template = "miner_offline";
+    else if (next === "ONLINE")     template = "miner_recovered";
     else if (next === "MAINTENANCE") template = "miner_maintenance";
 
     if (template) {
-      const baseKey  = `miner:${minerId}:${prev}->${next}:${sISO}`;
-      const pushKey  = `${baseKey}:push`;
+      const baseKey   = `miner:${minerId}:${prev}->${next}:${sISO}`;
+      const pushKey   = `${baseKey}:push`;
+      const inappKey  = `${baseKey}:inapp`;
+
       const payload = {
         minerId: minerId,
         worker: miner.worker_name || null,
@@ -118,12 +122,22 @@ export async function processMiner(minerId) {
         atUtc: now.toISOString()
       };
 
-      // Dono (PUSH)
+      // Dono (PUSH) – usa payload cru, build feito no deliver
       await sql/*sql*/`
         INSERT INTO notification_outbox
           (dedupe_key, audience_kind, audience_ref, channel, template, payload_json)
         VALUES
           (${pushKey}, 'user', ${miner.user_id}, 'push', ${template}, ${JSON.stringify(payload)}::jsonb)
+        ON CONFLICT (dedupe_key) DO NOTHING
+      `;
+
+      // Dono (IN-APP) – grava já com title/body/data para o front mostrar certo
+      const inappPayload = buildPushFromTemplate(template, payload); // {title, body, data}
+      await sql/*sql*/`
+        INSERT INTO notification_outbox
+          (dedupe_key, audience_kind, audience_ref, channel, template, payload_json, status, send_after_utc)
+        VALUES
+          (${inappKey}, 'user', ${miner.user_id}, 'inapp', ${template}, ${JSON.stringify(inappPayload)}::jsonb, 'sent', ${now})
         ON CONFLICT (dedupe_key) DO NOTHING
       `;
 
