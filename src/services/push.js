@@ -1,69 +1,72 @@
-// src/services/push.js
 import { Expo } from "expo-server-sdk";
 import { sql } from "../config/db.js";
 
-const expo = new Expo();
+// ⚠️ Android precisa disto em 2024/2025
+const expo = new Expo({ useFcmV1: true });
 
-/** Guarda/atualiza o token (UPSERT por token) */
 export async function upsertPushToken({ userId, token, platform, appVersion }) {
   await sql/*sql*/`
     INSERT INTO push_tokens (user_id, token, platform, app_version, last_seen)
     VALUES (${userId}, ${token}, ${platform ?? null}, ${appVersion ?? null}, NOW())
-    ON CONFLICT (token)
-    DO UPDATE SET user_id = EXCLUDED.user_id,
-                  platform = EXCLUDED.platform,
-                  app_version = EXCLUDED.app_version,
-                  last_seen = NOW()
+    ON CONFLICT (token) DO UPDATE
+      SET user_id = EXCLUDED.user_id,
+          platform = EXCLUDED.platform,
+          app_version = EXCLUDED.app_version,
+          last_seen = NOW()
   `;
 }
 
-/** Lista tokens válidos (filtro básico por formato Expo) */
 export async function getUserExpoTokens(userId) {
-  const rows = await sql/*sql*/`
-    SELECT token FROM push_tokens
-    WHERE user_id = ${userId}
-  `;
-  return rows
-    .map((r) => r.token)
-    .filter((t) => typeof t === "string" && Expo.isExpoPushToken(t));
+  const rows = await sql/*sql*/`SELECT token FROM push_tokens WHERE user_id=${userId}`;
+  return rows.map(r => r.token).filter(t => typeof t === "string" && Expo.isExpoPushToken(t));
 }
 
-/** Envia notificação para todos os tokens do user (com chunk & limpeza de inválidos) */
-export async function sendPushToUser(userId, message /* { title, body, data, sound? } */) {
+export async function sendPushToUser(userId, message) {
   const tokens = await getUserExpoTokens(userId);
-  if (!tokens.length) return { sent: 0, receipts: [] };
+  if (!tokens.length) return { sent: 0, receipts: [], errors: ["no_valid_tokens"] };
 
   const messages = tokens.map((to) => ({
     to,
-    sound: message.sound ?? "default",
-    title: message.title,
-    body: message.body,
-    data: message.data ?? {},
+    title: String(message?.title ?? ""),
+    body: String(message?.body ?? ""),
+    data: message?.data ?? {},
+    sound: message?.sound ?? "default",
+    // ⚠️ Android precisa de canal que exista no app
+    channelId: "default",
   }));
 
   const chunks = expo.chunkPushNotifications(messages);
-  const receipts = [];
+  const tickets = [];
+  const errors = [];
+
   for (const chunk of chunks) {
     try {
       const res = await expo.sendPushNotificationsAsync(chunk);
-      receipts.push(...res);
-    } catch (err) {
-      console.error("expo.sendPushNotificationsAsync error:", err);
+      tickets.push(...res);
+    } catch (e) {
+      errors.push(String(e?.message ?? e));
     }
   }
 
-  // limpeza de tokens inválidos (best-effort, sem checar /receipts endpoint)
-  const invalidTokens = receipts
-    .map((r, i) => ({ r, token: messages[i]?.to }))
-    .filter((x) => x.r?.status === "error" && (x.r?.details?.error === "DeviceNotRegistered" || x.r?.details?.error === "InvalidCredentials"))
-    .map((x) => x.token);
+  // conta só os OK
+  const okCount = tickets.filter(t => t?.status !== "error" && t?.id).length;
 
-  if (invalidTokens.length) {
-    await sql/*sql*/`
-      DELETE FROM push_tokens
-      WHERE token = ANY(${invalidTokens})
-    `;
+  // limpa tokens mortos imediatamente
+  const toDelete = tickets
+    .map((t, i) => ({ t, token: messages[i]?.to }))
+    .filter(x => x.t?.status === "error" && (x.t?.details?.error === "DeviceNotRegistered" || x.t?.details?.error === "InvalidCredentials"))
+    .map(x => x.token);
+
+  if (toDelete.length) {
+    await sql/*sql*/`DELETE FROM push_tokens WHERE token = ANY(${toDelete})`;
   }
 
-  return { sent: tokens.length, receipts };
+  // devolve erros úteis para o outbox marcar error/dead
+  const ticketErrors = tickets
+    .filter(t => t?.status === "error")
+    .map(t => `${t?.details?.error || "unknown"}:${t?.message || ""}`);
+  if (ticketErrors.length) errors.push(...ticketErrors);
+
+  const receipts = tickets.map(t => t?.id).filter(Boolean);
+  return { sent: okCount, receipts, errors };
 }
