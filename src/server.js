@@ -1,7 +1,7 @@
 // src/server.js
 import express from "express";
 import dotenv from "dotenv";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { clerkMiddleware } from "@clerk/express";
 
 import { sql } from "./config/db.js";
@@ -47,17 +47,25 @@ const minersListLimiter = rateLimit({
   limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) =>
-    (req.params?.userId && `user:${req.params.userId}`) ||
-    (req.headers["x-user-email"] && `email:${String(req.headers["x-user-email"]).toLowerCase()}`) ||
-    req.ip,
+
+  keyGenerator: (req) => {
+    if (req.params?.userId) return `user:${req.params.userId}`;
+    if (req.headers["x-user-email"]) {
+      return `email:${String(req.headers["x-user-email"]).toLowerCase()}`;
+    }
+    // usa helper IPv6-safe
+    return ipKeyGenerator(req);
+  },
+
   handler: (req, res) => {
     const retry = 60; // segundos
     res.setHeader("Retry-After", String(retry));
     res.status(429).json({ message: "Too many requests, please try again later :)" });
   },
+
   skip: (req) => req.method === "OPTIONS" || req.method === "HEAD",
 });
+
 
 // ⚠️ IMPORTANTE: esta rota vem ANTES do limiter global
 app.get("/api/miners/user/:userId", preListCache(), minersListLimiter, listarMinersPorUser);
