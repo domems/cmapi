@@ -1,13 +1,15 @@
 // src/server.js
 import express from "express";
 import dotenv from "dotenv";
+import rateLimit from "express-rate-limit";
+import { clerkMiddleware } from "@clerk/express";
+
 import { sql } from "./config/db.js";
-import rateLimiter from "./middleware/rateLimiter.js";
-import minerRoutes from "./routes/miners.js";
+import rateLimiter from "./middleware/rateLimiter.js";            // o teu limiter global (mantém)
+import minerRoutes from "./routes/minersRoutes.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
 import statusRoutes from "./routes/statusRoutes.js";
 import storeMinersRoutes from "./routes/storeMinersRoutes.js";
-import { startAllJobs } from "./jobs/index.js";
 import invoicesRoutes from "./routes/invoices.js";
 import paymentsRoutes from "./routes/payments.js";
 import minersAdminRoutes from "./routes/minersAdminRoutes.js";
@@ -15,29 +17,58 @@ import adminInvoicesRouter from "./routes/adminInvoicesRouter.js";
 import notificationsRouter from "./routes/notifications.js";
 import pushRouter from "./routes/push.js";
 import prefsRouter from "./routes/prefs.js";
-
-import { clerkMiddleware } from "@clerk/express";
 import authRouter from "./routes/auth.js";
 import { adminOnly } from "./middleware/adminOnly.js";
+
+import { preListCache } from "./middleware/preListCache.js";       // <<< NOVO (diretório singular!)
+import { listarMinersPorUser } from "./controllers/minersController.js"; // handler concreto
 
 dotenv.config();
 
 const PORT = process.env.PORT || 5001;
 const app = express();
 
+/* ================= Clerk e body parsers ================= */
 // Clerk primeiro (popular req.auth)
 app.use(clerkMiddleware());
 
 // raw body só no webhook NOWPayments (ANTES do json)
 app.use("/api/payments/webhook/nowpayments", express.raw({ type: "*/*" }));
 
-// middlewares gerais
-app.use(rateLimiter);
+// JSON parser para o resto
 app.use(express.json());
+
+/* ================= Rota especial com pré-cache antes do limiter =================
+   — Serve 304/200 a partir de cache sem “gastar” rate-limit.
+   — Se não houver cache fresco, cai no handler normal com um limiter dedicado.
+*/
+const minersListLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) =>
+    (req.params?.userId && `user:${req.params.userId}`) ||
+    (req.headers["x-user-email"] && `email:${String(req.headers["x-user-email"]).toLowerCase()}`) ||
+    req.ip,
+  handler: (req, res) => {
+    const retry = 60; // segundos
+    res.setHeader("Retry-After", String(retry));
+    res.status(429).json({ message: "Too many requests, please try again later :)" });
+  },
+  skip: (req) => req.method === "OPTIONS" || req.method === "HEAD",
+});
+
+// ⚠️ IMPORTANTE: esta rota vem ANTES do limiter global
+app.get("/api/miners/user/:userId", preListCache(), minersListLimiter, listarMinersPorUser);
+
+/* ================= Middlewares/rotas do resto da app ================= */
+// Limiter global (aplica-se a tudo o resto)
+app.use(rateLimiter);
 
 // ---- rotas públicas/gerais ----
 app.use("/api/clerk", clerkRoutes);
-app.use("/api/miners", minerRoutes);
+app.use("/api/miners", minerRoutes); // mantém as outras rotas de miners
 app.use("/api", statusRoutes);
 app.use("/api", storeMinersRoutes);
 app.use("/api", invoicesRoutes);
@@ -46,12 +77,10 @@ app.use("/api", notificationsRouter);
 app.use("/api", pushRouter);
 app.use("/api", prefsRouter);
 
-
 // bootstrap de roles
 app.use("/api/auth", authRouter);
 
 // ---- rotas ADMIN (protegidas) ----
-// ✅ monta em /api/admin (um único /admin no caminho)
 app.use("/api/admin", adminOnly, minersAdminRoutes);
 app.use("/api/admin", adminOnly, adminInvoicesRouter);
 
@@ -61,10 +90,9 @@ app.get("/api/healthz", (_req, res) => res.json({ ok: true }));
 
 console.log("my port:", process.env.PORT);
 
-// ✅ Cria/actualiza tabela conforme o teu schema real
+/* ================= DB bootstrap ================= */
 async function initDB() {
   try {
-    // ======= Tua tabela miners (mantido) =======
     await sql/*sql*/`
       CREATE TABLE IF NOT EXISTS miners (
         id SERIAL PRIMARY KEY,
@@ -81,7 +109,8 @@ async function initDB() {
         api_key TEXT,
         secret_key TEXT,
         coin TEXT,
-        pool TEXT
+        pool TEXT,
+        updated_at TIMESTAMP WITHOUT TIME ZONE
       );
     `;
     await sql/*sql*/`
@@ -90,7 +119,6 @@ async function initDB() {
     `;
     await sql/*sql*/`ALTER TABLE miners DROP COLUMN IF EXISTS data_registo;`;
 
-    // ======= NOVA: Tabela de push tokens =======
     await sql/*sql*/`
       CREATE TABLE IF NOT EXISTS push_tokens (
         id BIGSERIAL PRIMARY KEY,
@@ -101,9 +129,7 @@ async function initDB() {
         last_seen TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `;
-    await sql/*sql*/`
-      CREATE INDEX IF NOT EXISTS push_tokens_user_id_idx ON push_tokens(user_id);
-    `;
+    await sql/*sql*/`CREATE INDEX IF NOT EXISTS push_tokens_user_id_idx ON push_tokens(user_id);`;
 
     console.log("✅ DB pronta (miners & push_tokens).");
   } catch (err) {
@@ -112,10 +138,9 @@ async function initDB() {
   }
 }
 
-// arranque
+/* ================= Arranque ================= */
 initDB().then(() => {
   app.listen(PORT, () => {
-    startAllJobs();
     console.log("Server is up and running at port", PORT);
   });
 });
