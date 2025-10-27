@@ -3,7 +3,7 @@ import express from "express";
 import dotenv from "dotenv";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { clerkMiddleware } from "@clerk/express";
-
+import { startAllJobs } from "./jobs/index.js";
 import { sql } from "./config/db.js";
 import rateLimiter from "./middleware/rateLimiter.js";            // o teu limiter global (mantém)
 import minerRoutes from "./routes/minersRoutes.js";
@@ -150,5 +150,6 @@ async function initDB() {
 initDB().then(() => {
   app.listen(PORT, () => {
     console.log("Server is up and running at port", PORT);
+    startAllJobs();
   });
 });
