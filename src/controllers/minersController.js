@@ -1,11 +1,11 @@
+// src/controllers/minersController.js
 import { sql } from "../config/db.js";
 import {
   setCachedList,
-  getCachedList,
   invalidateUserList,
 } from "../services/minersListCache.js";
 
-/* ===================== Utils ===================== */
+/* ===================== Helpers ===================== */
 
 function normalizeDecimal(input) {
   if (input === undefined || input === null || input === "") return null;
@@ -16,10 +16,10 @@ function normalizeDecimal(input) {
   const s0 = String(input).trim().replace(/\s+/g, "");
   let s = s0;
   const hasComma = s.includes(",");
-  const hasDot   = s.includes(".");
+  const hasDot = s.includes(".");
   if (hasComma && hasDot) {
     const lastComma = s.lastIndexOf(",");
-    const lastDot   = s.lastIndexOf(".");
+    const lastDot = s.lastIndexOf(".");
     const decSep = lastComma > lastDot ? "," : ".";
     const thouSep = decSep === "," ? /\./g : /,/g;
     s = s.replace(thouSep, "").replace(decSep, ".");
@@ -29,6 +29,17 @@ function normalizeDecimal(input) {
   const n = Number(s);
   if (!Number.isFinite(n)) throw new Error(`Valor numérico inválido: "${input}"`);
   return n;
+}
+
+/** Garante que :id é inteiro (evita 22P02 no Postgres) */
+function parseIntIdOr400(req, res) {
+  const raw = req.params?.id;
+  const num = Number(raw);
+  if (!Number.isInteger(num)) {
+    res.status(400).json({ error: "Parâmetro id inválido (tem de ser inteiro)." });
+    return null;
+  }
+  return num;
 }
 
 /* ===================== Criar ===================== */
@@ -55,19 +66,21 @@ export const criarMiner = async (req, res) => {
       return res.status(400).json({ error: "Campos obrigatórios em falta: user_id e nome." });
     }
 
-    let hashRateNum = null, precoKwNum = null, consumoNum = null;
+    let hashRateNum = null,
+      precoKwNum = null,
+      consumoNum = null;
     try {
       hashRateNum = normalizeDecimal(hash_rate);
-      precoKwNum  = normalizeDecimal(preco_kw);
-      consumoNum  = normalizeDecimal(consumo_kw_hora);
+      precoKwNum = normalizeDecimal(preco_kw);
+      consumoNum = normalizeDecimal(consumo_kw_hora);
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
 
-    const lockedVal = (typeof locked === "boolean") ? locked : true;
+    const lockedVal = typeof locked === "boolean" ? locked : true;
     const statusVal = status ? String(status).toLowerCase() : "offline";
 
-    const [novoMiner] = await sql`
+    const [novoMiner] = await sql/*sql*/`
       INSERT INTO miners (
         user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
         worker_name, api_key, secret_key, coin, pool, locked
@@ -99,24 +112,38 @@ export const criarMiner = async (req, res) => {
 
 /* ===================== Atualizar (Admin) ===================== */
 export const atualizarMinerComoAdmin = async (req, res) => {
-  const { id } = req.params;
+  const id = parseIntIdOr400(req, res);
+  if (id === null) return;
+
   const {
     user_id,
-    nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
-    worker_name, api_key, secret_key, coin, pool, locked
+    nome,
+    modelo,
+    hash_rate,
+    preco_kw,
+    consumo_kw_hora,
+    status,
+    worker_name,
+    api_key,
+    secret_key,
+    coin,
+    pool,
+    locked,
   } = req.body || {};
 
   try {
-    let hashRateNum = undefined, precoKwNum = undefined, consumoNum = undefined;
+    let hashRateNum,
+      precoKwNum,
+      consumoNum;
     try {
       if (hash_rate !== undefined) hashRateNum = normalizeDecimal(hash_rate);
-      if (preco_kw  !== undefined) precoKwNum  = normalizeDecimal(preco_kw);
+      if (preco_kw !== undefined) precoKwNum = normalizeDecimal(preco_kw);
       if (consumo_kw_hora !== undefined) consumoNum = normalizeDecimal(consumo_kw_hora);
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
 
-    const [updated] = await sql`
+    const [updated] = await sql/*sql*/`
       UPDATE miners
       SET
         user_id           = COALESCE(${user_id ?? null}, user_id),
@@ -139,7 +166,7 @@ export const atualizarMinerComoAdmin = async (req, res) => {
 
     if (!updated) return res.status(404).json({ error: "Miner não encontrada." });
 
-    // invalida cache do dono (antigo e novo user, se mudou)
+    // invalida cache do dono (antigo e/ou novo user, se mudou)
     const targetUserId = updated.user_id ?? user_id;
     if (targetUserId) invalidateUserList(String(targetUserId));
 
@@ -152,11 +179,13 @@ export const atualizarMinerComoAdmin = async (req, res) => {
 
 /* ========== Atualização por cliente (campos do cliente) ========== */
 export const atualizarMinerComoCliente = async (req, res) => {
-  const { id } = req.params;
+  const id = parseIntIdOr400(req, res);
+  if (id === null) return;
+
   const { worker_name, api_key, secret_key, coin, pool } = req.body || {};
 
   try {
-    const [curr] = await sql`
+    const [curr] = await sql/*sql*/`
       SELECT id, user_id, locked, worker_name AS w, api_key AS a, secret_key AS s, coin AS c, pool AS p
       FROM miners
       WHERE id = ${id}
@@ -175,7 +204,7 @@ export const atualizarMinerComoCliente = async (req, res) => {
       return res.status(400).json({ error: "Para Binance, api_key e secret_key são obrigatórias." });
     }
 
-    const [updatedMiner] = await sql`
+    const [updatedMiner] = await sql/*sql*/`
       UPDATE miners
       SET
         worker_name = COALESCE(${worker_name ?? null}, worker_name),
@@ -198,9 +227,11 @@ export const atualizarMinerComoCliente = async (req, res) => {
 
 /* ===================== Ler ===================== */
 export const obterMinerPorId = async (req, res) => {
-  const { id } = req.params;
+  const id = parseIntIdOr400(req, res);
+  if (id === null) return;
+
   try {
-    const [miner] = await sql`SELECT * FROM miners WHERE id = ${id}`;
+    const [miner] = await sql/*sql*/`SELECT * FROM miners WHERE id = ${id}`;
     if (!miner) return res.status(404).json({ error: "Mineradora não encontrada" });
     res.json(miner);
   } catch (err) {
@@ -217,7 +248,7 @@ export const listarMinersPorUser = async (req, res) => {
   const { userId } = req.params;
 
   try {
-    const miners = await sql`
+    const miners = await sql/*sql*/`
       SELECT * FROM miners
       WHERE user_id = ${userId}
       ORDER BY created_at DESC;
@@ -243,7 +274,9 @@ export const listarMinersPorUser = async (req, res) => {
 
 /* ===================== Status & Delete ===================== */
 export const atualizarStatusMiner = async (req, res) => {
-  const { id } = req.params;
+  const id = parseIntIdOr400(req, res);
+  if (id === null) return;
+
   const { status } = req.body || {};
   try {
     if (status !== undefined) {
@@ -252,7 +285,7 @@ export const atualizarStatusMiner = async (req, res) => {
         return res.status(400).json({ error: "Status inválido (use 'online' | 'offline' | 'maintenance')." });
       }
     }
-    const [updatedMiner] = await sql`
+    const [updatedMiner] = await sql/*sql*/`
       UPDATE miners
       SET status = ${status}, updated_at = NOW()
       WHERE id = ${id}
@@ -268,10 +301,12 @@ export const atualizarStatusMiner = async (req, res) => {
 };
 
 export const apagarMiner = async (req, res) => {
-  const { id } = req.params;
+  const id = parseIntIdOr400(req, res);
+  if (id === null) return;
+
   try {
-    const [curr] = await sql`SELECT user_id FROM miners WHERE id = ${id} LIMIT 1`;
-    await sql`DELETE FROM miners WHERE id = ${id}`;
+    const [curr] = await sql/*sql*/`SELECT user_id FROM miners WHERE id = ${id} LIMIT 1`;
+    await sql/*sql*/`DELETE FROM miners WHERE id = ${id}`;
     if (curr?.user_id) invalidateUserList(String(curr.user_id));
     res.status(204).send();
   } catch (err) {

@@ -12,29 +12,19 @@ import {
 const router = express.Router();
 
 /**
- * Ordem importa.
- * Rotas específicas primeiro; listagem por utilizador por último.
+ * Ordem importa. Rotas específicas primeiro.
+ * MUITO IMPORTANTE: /user/:userId TEM de vir ANTES de "/:id"
  */
 
-// criar
-router.post("/", criarMiner);
-
-// atualizar como admin (todos os campos permitidos)
-router.put("/admin/:id", atualizarMinerComoAdmin);
-
-// atualizar como cliente (apenas campos do cliente)
+// atualizar como cliente
 router.put("/cliente/:id", atualizarMinerComoCliente);
 
-// atualizar status explícito
-router.put("/:id/status", atualizarStatusMiner);
+
+// LISTAR por utilizador (<<< ANTES do "/:id")
+router.get("/user/:userId", listarMinersPorUser);
 
 // ler por id
 router.get("/:id", obterMinerPorId);
 
-// apagar
-router.delete("/:id", apagarMiner);
-
-// LISTAR por utilizador (não colide com /:id)
-router.get("/user/:userId", listarMinersPorUser);
 
 export default router;
