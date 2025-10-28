@@ -25,8 +25,8 @@ const CURR_TTL_MS = 15 * 60 * 1000;
 let _currCache = { list: null, ts: 0 };
 
 /* ================== DB HELPERS ================== */
-async function invoiceById(trx, id) {
-  const [row] = await trx/*sql*/`
+async function invoiceById(id) {
+  const [row] = await sql/*sql*/`
     SELECT id, user_id, subtotal_amount, status,
            provider_payment_id, provider_currency, pay_network, pay_address, pay_amount, pay_url
     FROM energy_invoices
@@ -35,11 +35,21 @@ async function invoiceById(trx, id) {
   `;
   return row || null;
 }
-async function assertInvoiceOwnershipOrAdmin(trx, invoiceId, userId, isAdmin = false) {
-  const inv = await invoiceById(trx, invoiceId);
-  if (!inv) return { inv: null, allowed: false };
-  if (isAdmin) return { inv, allowed: true };
-  return { inv, allowed: String(inv.user_id) === String(userId) };
+function canAccess(inv, userId, isAdmin) {
+  if (!inv) return false;
+  if (isAdmin) return true;
+  return String(inv.user_id) === String(userId);
+}
+async function txRun(fn) {
+  await sql/*sql*/`BEGIN`;
+  try {
+    const r = await fn();
+    await sql/*sql*/`COMMIT`;
+    return r;
+  } catch (e) {
+    try { await sql/*sql*/`ROLLBACK`; } catch {}
+    throw e;
+  }
 }
 
 /* ================== OPTIONAL COLUMNS ================== */
@@ -58,7 +68,7 @@ const EXTRA_COLS = {
     const names = new Set(cols.map(c => c.column_name));
     for (const k of Object.keys(EXTRA_COLS)) EXTRA_COLS[k] = names.has(k);
   } catch (e) {
-    console.warn("[payments] Failed to detect optional columns:", e?.message || e);
+    console.warn("[payments] optional columns detection failed:", e?.message || e);
   }
 })();
 
@@ -71,14 +81,13 @@ async function getNowCurrenciesCached() {
   const raw = await r.text();
   let data; try { data = JSON.parse(raw); } catch { data = raw; }
   if (!r.ok) {
-    const msg = (data && data.message) ? data.message : raw;
+    const msg = (data && (data.message || data.error)) ? (data.message || data.error) : raw;
     throw new Error(`NOWPayments /currencies HTTP ${r.status}: ${msg}`);
   }
   let list = Array.isArray(data) ? data : (data.currencies || data.supported_currencies || []);
   _currCache = { list: list.map(s => String(s).toUpperCase()), ts: now };
   return _currCache.list;
 }
-
 async function mapPayCurrency(currency, network) {
   const c = String(currency).toUpperCase();
   const n = String(network || "").toUpperCase();
@@ -105,7 +114,6 @@ async function mapPayCurrency(currency, network) {
   }
   throw new Error("Moeda não suportada");
 }
-
 const normalizeProviderStatus = s => String(s || "").toLowerCase();
 const getAuthContext = (req) => {
   const role = req.auth?.sessionClaims?.public_metadata?.role;
@@ -115,12 +123,12 @@ const getAuthContext = (req) => {
 
 /* ================== ROUTES ================== */
 
-/** Create intent */
+/** Create intent (no sql.begin; usa tx manual só no UPDATE) */
 router.post(
   "/payments/create-intent",
   clerkMiddleware(),
   requireAuth(),
-  express.json(), // se o app não tiver global
+  express.json(),
   async (req, res) => {
     const { userId, isAdmin } = getAuthContext(req);
     try {
@@ -136,73 +144,68 @@ router.post(
       if (cur === "USDC" && !USDC_NETWORKS.includes(net)) return res.status(400).json({ error: "Rede inválida para USDC" });
       if (cur !== "USDC") net = "NATIVE"; // BTC/LTC
 
-      let responseSent = false;
+      // 1) Lê a fatura e autoriza (sem transação)
+      const inv = await invoiceById(invoiceId);
+      if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
+      if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
+      if (inv.status === "pago") return res.status(409).json({ error: "Fatura já paga" });
 
-      await sql.begin(async (trx) => {
-        const { inv, allowed } = await assertInvoiceOwnershipOrAdmin(trx, invoiceId, userId, isAdmin);
-        if (!inv) { responseSent = true; return res.status(404).json({ error: "Fatura não encontrada" }); }
-        if (!allowed) { responseSent = true; return res.status(403).json({ error: "forbidden" }); }
-        if (inv.status === "pago") { responseSent = true; return res.status(409).json({ error: "Fatura já paga" }); }
+      // 2) Idempotência: se já tem intent válido a aguardar pagamento → reusa
+      if (inv.provider_payment_id && inv.status === "aguarda_pagamento") {
+        return res.json({
+          ok: true,
+          intent: {
+            invoice_id: inv.id,
+            currency: inv.provider_currency || cur,
+            network: inv.pay_network || net,
+            amount_fiat: inv.subtotal_amount,
+            amount_crypto: inv.pay_amount,
+            payment_address: inv.pay_address,
+            pay_url: inv.pay_url,
+            status: inv.status,
+          },
+        });
+      }
 
-        // Idempotência: se já aguardando pagamento, reutiliza
-        if (inv.provider_payment_id && inv.status === "aguarda_pagamento") {
-          responseSent = true;
-          return res.json({
-            ok: true,
-            intent: {
-              invoice_id: inv.id,
-              currency: inv.provider_currency || cur,
-              network: inv.pay_network || net,
-              amount_fiat: inv.subtotal_amount,
-              amount_crypto: inv.pay_amount,
-              payment_address: inv.pay_address,
-              pay_url: inv.pay_url,
-              status: inv.status,
-            },
-          });
+      // 3) Mapeia moeda+rede
+      let pay_currency;
+      try {
+        pay_currency = await mapPayCurrency(cur, net);
+      } catch (mapErr) {
+        return res.status(400).json({ error: String(mapErr?.message || mapErr) });
+      }
+
+      // 4) Cria pagamento no PSP
+      const price_amount = Number(inv.subtotal_amount);
+      const payload = {
+        price_amount,
+        price_currency: "USD",
+        pay_currency,
+        order_id: `invoice_${invoiceId}`,
+        order_description: `Energia #${invoiceId}`,
+        ...(NOW_IPN_URL ? { ipn_callback_url: NOW_IPN_URL } : {}),
+      };
+
+      let np, raw;
+      try {
+        const npRes = await fetch(`${NOW_API}/payment`, {
+          method: "POST",
+          headers: { "x-api-key": NOW_API_KEY, "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        raw = await npRes.text();
+        try { np = JSON.parse(raw); } catch { np = raw; }
+        if (!npRes.ok || !np?.payment_id) {
+          const msg = (np && (np.message || np.error || np.errors)) ? (np.message || np.error || JSON.stringify(np.errors)) : raw;
+          return res.status(502).json({ error: "Erro PSP", provider_error: msg });
         }
+      } catch (e) {
+        return res.status(502).json({ error: "Erro PSP (network)", detail: String(e?.message || e) });
+      }
 
-        // Mapeia moeda+rede
-        let pay_currency;
-        try {
-          pay_currency = await mapPayCurrency(cur, net);
-        } catch (mapErr) {
-          responseSent = true;
-          return res.status(400).json({ error: String(mapErr?.message || mapErr) });
-        }
-
-        const price_amount = Number(inv.subtotal_amount);
-        const payload = {
-          price_amount,
-          price_currency: "USD",
-          pay_currency,
-          order_id: `invoice_${invoiceId}`,
-          order_description: `Energia #${invoiceId}`,
-          ...(NOW_IPN_URL ? { ipn_callback_url: NOW_IPN_URL } : {}),
-        };
-
-        // Cria no PSP
-        let np, raw;
-        try {
-          const npRes = await fetch(`${NOW_API}/payment`, {
-            method: "POST",
-            headers: { "x-api-key": NOW_API_KEY, "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-          raw = await npRes.text();
-          try { np = JSON.parse(raw); } catch { np = raw; }
-
-          if (!npRes.ok || !np?.payment_id) {
-            responseSent = true;
-            const msg = (np && (np.message || np.error || np.errors)) ? (np.message || np.error || JSON.stringify(np.errors)) : raw;
-            return res.status(502).json({ error: "Erro PSP", provider_error: msg });
-          }
-        } catch (e) {
-          responseSent = true;
-          return res.status(502).json({ error: "Erro PSP (network)", detail: String(e?.message || e) });
-        }
-
-        await trx/*sql*/`
+      // 5) UPDATE em transação manual
+      await txRun(async () => {
+        await sql/*sql*/`
           UPDATE energy_invoices
           SET status='aguarda_pagamento',
               provider_payment_id=${Number(np.payment_id)},
@@ -215,31 +218,28 @@ router.post(
           WHERE id=${invoiceId}
         `;
         if (EXTRA_COLS.provider_status) {
-          await trx/*sql*/`
+          await sql/*sql*/`
             UPDATE energy_invoices
             SET provider_status=${normalizeProviderStatus(np.payment_status)}
             WHERE id=${invoiceId}
           `;
         }
-
-        responseSent = true;
-        return res.json({
-          ok: true,
-          intent: {
-            invoice_id: invoiceId,
-            currency: cur,
-            network: net,
-            provider_currency: pay_currency,
-            amount_fiat: price_amount,
-            amount_crypto: np.pay_amount || null,
-            payment_address: np.pay_address || null,
-            pay_url: np.invoice_url || null,
-            status: "pending",
-          },
-        });
       });
 
-      if (!responseSent) return res.status(500).json({ error: "Falha interna" });
+      return res.json({
+        ok: true,
+        intent: {
+          invoice_id: invoiceId,
+          currency: cur,
+          network: net,
+          provider_currency: pay_currency,
+          amount_fiat: price_amount,
+          amount_crypto: np.pay_amount || null,
+          payment_address: np.pay_address || null,
+          pay_url: np.invoice_url || null,
+          status: "pending",
+        },
+      });
     } catch (err) {
       console.error("create-intent:", err);
       return res.status(500).json({ error: String(err?.message || "Erro interno") });
@@ -249,14 +249,18 @@ router.post(
 
 /** Read intent */
 router.get("/payments/intent", clerkMiddleware(), requireAuth(), async (req, res) => {
-  const { userId, isAdmin } = getAuthContext(req);
+  const role = req.auth?.sessionClaims?.public_metadata?.role;
+  const isAdmin = typeof role === "string" && role.toLowerCase().includes("admin");
+  const userId = req.auth?.userId || null;
+
   try {
     const invoiceId = Number(req.query.invoiceId);
     if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
-    const result = await sql.begin(async (trx) => await assertInvoiceOwnershipOrAdmin(trx, invoiceId, userId, isAdmin));
-    const { inv, allowed } = result || {};
+
+    const inv = await invoiceById(invoiceId);
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
-    if (!allowed) return res.status(403).json({ error: "forbidden" });
+    if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
+
     return res.json({
       ok: true,
       intent: {
@@ -279,16 +283,17 @@ router.get("/payments/intent", clerkMiddleware(), requireAuth(), async (req, res
 
 /** Sync (GET or POST) */
 async function syncHandler(req, res) {
-  const { userId, isAdmin } = getAuthContext(req);
+  const role = req.auth?.sessionClaims?.public_metadata?.role;
+  const isAdmin = typeof role === "string" && role.toLowerCase().includes("admin");
+  const userId = req.auth?.userId || null;
+
   try {
     const invoiceId = Number(req.method === "GET" ? req.query.invoiceId : req.body?.invoiceId);
     if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
 
-    const result = await sql.begin(async (trx) => await assertInvoiceOwnershipOrAdmin(trx, invoiceId, userId, isAdmin));
-    const { inv, allowed } = result || {};
+    const inv = await invoiceById(invoiceId);
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
-    if (!allowed) return res.status(403).json({ error: "forbidden" });
-
+    if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
     if (!inv.provider_payment_id) return res.status(400).json({ error: "sem provider_payment_id" });
 
     const r = await fetch(`${NOW_API}/payment/${inv.provider_payment_id}`, {
@@ -301,16 +306,18 @@ async function syncHandler(req, res) {
     }
 
     const status = normalizeProviderStatus(p.payment_status);
-    await sql.begin(async (trx) => {
-      if (status === "finished")
-        await trx/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
-      else if (status === "partially_paid")
-        await trx/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
-      else if (["failed","expired"].includes(status))
-        await trx/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
-      if (EXTRA_COLS.provider_status)
-        await trx/*sql*/`UPDATE energy_invoices SET provider_status=${status} WHERE id=${invoiceId}`;
-    });
+
+    // Updates simples sem transação (suficiente aqui)
+    if (status === "finished") {
+      await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
+    } else if (status === "partially_paid") {
+      await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
+    } else if (["failed","expired"].includes(status)) {
+      await sql/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
+    }
+    if (EXTRA_COLS.provider_status) {
+      await sql/*sql*/`UPDATE energy_invoices SET provider_status=${status} WHERE id=${invoiceId}`;
+    }
 
     return res.json({ ok: true, provider_status: status });
   } catch (err) {
@@ -335,16 +342,17 @@ router.post("/payments/webhook", bodyParser.raw({ type: "application/json" }), a
     const orderId = String(p.order_id || "");
     const invoiceId = orderId.startsWith("invoice_") ? Number(orderId.replace("invoice_", "")) : null;
     if (!invoiceId) return res.json({ ok: true });
-    await sql.begin(async (trx) => {
-      if (EXTRA_COLS.provider_status)
-        await trx/*sql*/`UPDATE energy_invoices SET provider_status=${paymentStatus} WHERE id=${invoiceId}`;
-      if (paymentStatus === "finished")
-        await trx/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
-      else if (paymentStatus === "partially_paid")
-        await trx/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
-      else if (["failed","expired"].includes(paymentStatus))
-        await trx/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
-    });
+
+    // Updates diretos
+    if (EXTRA_COLS.provider_status)
+      await sql/*sql*/`UPDATE energy_invoices SET provider_status=${paymentStatus} WHERE id=${invoiceId}`;
+    if (paymentStatus === "finished")
+      await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
+    else if (paymentStatus === "partially_paid")
+      await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
+    else if (["failed","expired"].includes(paymentStatus))
+      await sql/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("webhook:", e);
@@ -363,7 +371,7 @@ router.get("/payments/qr", async (req, res) => {
     let uri = "";
     if (c === "BTC") uri = `bitcoin:${address}?amount=${amount}`;
     else if (c === "LTC") uri = `litecoin:${address}?amount=${amount}`;
-    else if (c === "USDC") uri = `${address}`; // stablecoins costumam não ter URI universal
+    else if (c === "USDC") uri = `${address}`; // estáveis não têm URI universal
     else uri = String(address);
 
     const qr = await QRCode.toDataURL(uri, { margin: 1, width: 300 });
