@@ -28,7 +28,8 @@
     "node-cron": "^4.2.1",
     "node-fetch": "^3.3.2",
     "postgres": "^3.4.7",
-    "puppeteer": "^24.15.0"
+    "puppeteer": "^24.15.0",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@flydotio/dockerfile": "^0.7.10",
