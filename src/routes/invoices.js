@@ -285,6 +285,44 @@ router.post("/invoices/close-now", async (req, res) => {
   const { year, month } = currentYearMonth();
 
   try {
+    // 0) calcular o subtotal atual a partir dos miners (mesma lógica do snapshot)
+    const miners = await sql/*sql*/`
+      SELECT
+        id,
+        COALESCE(nome, CONCAT('Miner#', id::text))   AS miner_nome,
+        COALESCE(total_horas_online,0)               AS hours_online,
+        COALESCE(consumo_kw_hora,0)                  AS consumo_kw_hora,
+        COALESCE(preco_kw,0)                         AS preco_kw
+      FROM miners
+      WHERE user_id = ${userId}
+    `;
+
+    const subtotalCalc = miners.reduce((acc, r) => {
+      const hours = Number(r.hours_online) || 0;
+      const consumo = Number(r.consumo_kw_hora) || 0;
+      const preco = Number(r.preco_kw) || 0;
+      const kwh = +(hours * consumo).toFixed(3);
+      const amount = +(kwh * preco).toFixed(2);
+      return acc + amount;
+    }, 0);
+
+    const subtotalRoundedCheck = Math.round(subtotalCalc * 100) / 100;
+
+    // 🔒 regra mínima
+    const MIN_TOTAL = 15; // USD
+    if (subtotalRoundedCheck < MIN_TOTAL) {
+      console.log("[POST] /invoices/close-now BLOCKED: subtotal < min", {
+        userId,
+        subtotalRoundedCheck,
+        min: MIN_TOTAL,
+      });
+      return res.status(400).json({
+        error: "Fatura demasiado baixa para fechar",
+        min_required: MIN_TOTAL,
+        current_subtotal: subtotalRoundedCheck,
+      });
+    }
+
     // 1) cria a fatura (SEM ON CONFLICT)
     const insertedInv = await sql/*sql*/`
       INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
@@ -355,6 +393,7 @@ router.post("/invoices/close-now", async (req, res) => {
     return res.status(500).json({ error: e?.detail || e?.message || "Erro ao fechar fatura" });
   }
 });
+
 
 
 
