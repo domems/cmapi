@@ -4,12 +4,11 @@ import { getMinerStatus, getMinersStatusMany } from "../controllers/statusContro
 
 const router = express.Router();
 
-// ✅ Batch primeiro para não colidir com /miners/:id/status
+// batch primeiro
 router.get("/miners-status", getMinersStatusMany);
 
-// ✅ Single (o controller já aceita :id ou :minerId)
+// single
 router.get("/miners/:id/status", getMinerStatus);
-// Se quiseres manter o teu path antigo também:
 router.get("/miners/:minerId/status", getMinerStatus);
 
 export default router;

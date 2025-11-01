@@ -7,7 +7,7 @@ import crypto from "crypto";
 const statusCache = new Map(); // key: minerId -> { data, ts }
 const CACHE_TTL_MS = 30 * 1000;
 
-/* ========= helpers ========= */
+/* ========= helpers básicos ========= */
 const toLower = (s) => String(s ?? "").toLowerCase();
 function clean(s) {
   return String(s ?? "").normalize("NFKC").replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
@@ -77,14 +77,19 @@ function buildMDUrls({ coin, account_id, api_key }) {
   const algo = mdAlgo(coin);
   const slug = mdSlug(coin);
   const mk = (name) =>
-    `${base}/pools/${name}.php?page=api&action=getuserworkers&id=${encodeURIComponent(account_id)}&api_key=${encodeURIComponent(api_key)}`;
+    `${base}/pools/${name}.php?page=api&action=getuserworkers&id=${encodeURIComponent(
+      account_id
+    )}&api_key=${encodeURIComponent(api_key)}`;
 
   const urls = [];
   if (algo) urls.push(mk(algo));
   if (slug) urls.push(mk(slug));
   if (algo === "sha256") urls.push(mk("scrypt"));
   if (algo === "scrypt") urls.push(mk("sha256"));
-  if (!algo && !slug) { urls.push(mk("sha256")); urls.push(mk("scrypt")); }
+  if (!algo && !slug) {
+    urls.push(mk("sha256"));
+    urls.push(mk("scrypt"));
+  }
   return urls;
 }
 function parseMDWorkersPayload(data) {
@@ -126,13 +131,19 @@ async function fetchJSON(url, opts = {}, retries = 1) {
       const res = await fetch(url, { ...opts, signal: controller.signal });
       clearTimeout(to);
       let text = "";
-      try { text = await res.text(); } catch {}
+      try {
+        text = await res.text();
+      } catch {}
       let json = null;
-      try { json = text ? JSON.parse(text) : null; } catch {}
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {}
       return { res, json, raw: text };
     } catch (e) {
       if (attempt > retries) throw e;
-      await new Promise(r => setTimeout(r, 300 * attempt + Math.random() * 300));
+      await new Promise((r) =>
+        setTimeout(r, 300 * attempt + Math.random() * 300)
+      );
     }
   }
 }
@@ -170,21 +181,25 @@ async function signedGET({ base, path, apiKey, secretKey, params, skewMs = 0 }) 
   return fetchJSON(url, { headers }, 1);
 }
 
-/* ========= CORE: fetch status de UM miner, normalizado ========= */
-async function fetchMinerStatusNormalized(minerId) {
-  const rows = await sql`
-    SELECT id, api_key, secret_key, coin, pool, worker_name
-    FROM miners
-    WHERE id::text = ${String(minerId)}
-    LIMIT 1
-  `;
-  if (!rows.length) return { id: String(minerId), error: "not_found" };
+/* ========= CORE: fetch status de UM miner, mas agora com rec já carregado ========= */
+async function fetchMinerStatusNormalized(minerId, preloaded) {
+  // 👉 se já me deram o registo do miner, não vou ao DB
+  let rec = preloaded;
+  if (!rec) {
+    const rows = await sql`
+      SELECT id, api_key, secret_key, coin, pool, worker_name
+      FROM miners
+      WHERE id::text = ${String(minerId)}
+      LIMIT 1
+    `;
+    if (!rows.length) return { id: String(minerId), error: "not_found" };
+    rec = rows[0];
+  }
 
-  const rec = rows[0];
   const { api_key, secret_key, coin, pool } = rec;
   const worker_name_db = rec.worker_name ?? "";
   const expectedTail = tail(worker_name_db);
-  const expectedKey  = tailKey(worker_name_db);
+  const expectedKey = tailKey(worker_name_db);
   if (!expectedTail) return { id: String(minerId), error: "no_worker_name" };
 
   let workers = [];
@@ -193,27 +208,35 @@ async function fetchMinerStatusNormalized(minerId) {
   // ====== POOLS ======
   if (pool === "ViaBTC") {
     source = "ViaBTC";
-    const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${encodeURIComponent(coin)}`;
-    const { res: r, json: data } = await fetchJSON(url, { headers: { "X-API-KEY": api_key } }, 1);
-    if (!r.ok || !data || data.code !== 0) return { id: String(minerId), error: "viabtc_error" };
+    const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${encodeURIComponent(
+      coin
+    )}`;
+    const { res: r, json: data } = await fetchJSON(
+      url,
+      { headers: { "X-API-KEY": api_key } },
+      1
+    );
+    if (!r.ok || !data || data.code !== 0)
+      return { id: String(minerId), error: "viabtc_error" };
     const list = Array.isArray(data?.data?.data) ? data.data.data : [];
     workers = list.map((w) => ({
       worker_name: String(w.worker_name ?? "").trim(),
       worker_status: w.worker_status,
       hashrate_10min: Number(w.hashrate_10min ?? 0),
     }));
-
   } else if (pool === "LiteCoinPool") {
     source = "LiteCoinPool";
-    const url = `https://www.litecoinpool.org/api?api_key=${encodeURIComponent(api_key)}`;
+    const url = `https://www.litecoinpool.org/api?api_key=${encodeURIComponent(
+      api_key
+    )}`;
     const { res: r, json: data } = await fetchJSON(url, {}, 1);
-    if (!r.ok || !data || !data.workers) return { id: String(minerId), error: "ltcp_error" };
+    if (!r.ok || !data || !data.workers)
+      return { id: String(minerId), error: "ltcp_error" };
     workers = Object.entries(data.workers).map(([name, info]) => ({
       worker_name: String(name ?? "").trim(),
       worker_status: info.connected ? "active" : "unactive",
       hashrate_10min: Number((info.hash_rate ?? 0) * 1000),
     }));
-
   } else if (pool === "Binance") {
     source = "Binance";
     if (!secret_key) return { id: String(minerId), error: "binance_no_secret" };
@@ -225,8 +248,10 @@ async function fetchMinerStatusNormalized(minerId) {
     if (!base) return { id: String(minerId), error: "binance_unavailable" };
 
     let L = await signedGET({
-      base, path: "/sapi/v1/mining/worker/list",
-      apiKey: api_key, secretKey: secret_key,
+      base,
+      path: "/sapi/v1/mining/worker/list",
+      apiKey: api_key,
+      secretKey: secret_key,
       params: { algo, userName: account, pageIndex: 1, pageSize: 200, sort: 0 },
     });
     if (!L.res.ok && L.json?.code === -1021) {
@@ -234,14 +259,19 @@ async function fetchMinerStatusNormalized(minerId) {
       if (serverTime) {
         const skewMs = serverTime - Date.now();
         L = await signedGET({
-          base, path: "/sapi/v1/mining/worker/list",
-          apiKey: api_key, secretKey: secret_key,
-          params: { algo, userName: account, pageIndex: 1, pageSize: 200, sort: 0 }, skewMs
+          base,
+          path: "/sapi/v1/mining/worker/list",
+          apiKey: api_key,
+          secretKey: secret_key,
+          params: { algo, userName: account, pageIndex: 1, pageSize: 200, sort: 0 },
+          skewMs,
         });
       }
     }
     if (!L.res.ok) return { id: String(minerId), error: "binance_error" };
-    const listArr = Array.isArray(L.json?.data?.workerDatas) ? L.json.data.workerDatas : [];
+    const listArr = Array.isArray(L.json?.data?.workerDatas)
+      ? L.json.data.workerDatas
+      : [];
     workers = listArr.map((w) => ({
       worker_name: String(w?.workerName ?? "").trim(),
       worker_status: Number(w?.status ?? 0) === 1 ? "active" : "unactive",
@@ -249,11 +279,17 @@ async function fetchMinerStatusNormalized(minerId) {
     }));
 
     // fallback detail
-    const seen = workers.some(w => tail(w.worker_name) === expectedTail || tailKey(w.worker_name) === expectedKey);
+    const seen = workers.some(
+      (w) =>
+        tail(w.worker_name) === expectedTail ||
+        tailKey(w.worker_name) === expectedKey
+    );
     if (!seen) {
       let D = await signedGET({
-        base, path: "/sapi/v1/mining/worker/detail",
-        apiKey: api_key, secretKey: secret_key,
+        base,
+        path: "/sapi/v1/mining/worker/detail",
+        apiKey: api_key,
+        secretKey: secret_key,
         params: { algo, userName: account, workerName: expectedTail },
       });
       if (!D.res.ok && D.json?.code === -1021) {
@@ -261,9 +297,12 @@ async function fetchMinerStatusNormalized(minerId) {
         if (serverTime) {
           const skewMs = serverTime - Date.now();
           D = await signedGET({
-            base, path: "/sapi/v1/mining/worker/detail",
-            apiKey: api_key, secretKey: secret_key,
-            params: { algo, userName: account, workerName: expectedTail }, skewMs
+            base,
+            path: "/sapi/v1/mining/worker/detail",
+            apiKey: api_key,
+            secretKey: secret_key,
+            params: { algo, userName: account, workerName: expectedTail },
+            skewMs,
           });
         }
       }
@@ -271,83 +310,118 @@ async function fetchMinerStatusNormalized(minerId) {
         const d = D.json.data;
         workers.push({
           worker_name: String(d?.workerName ?? expectedTail),
-          worker_status: Number(d?.status ?? 0) === 1 ? "active" : "unactive",
+          worker_status:
+            Number(d?.status ?? 0) === 1 ? "active" : "unactive",
           hashrate_10min: Number(d?.hashRate ?? 0),
         });
       }
     }
-
   } else if (pool === "F2Pool") {
     source = "F2Pool";
     const { account } = splitAccountWorker(worker_name_db);
     if (!account) return { id: String(minerId), error: "f2_bad_worker" };
     const currency = f2slug(coin || "BTC");
     const url = "https://api.f2pool.com/v2/hash_rate/worker/list";
-    const headers = { "Content-Type": "application/json", "F2P-API-SECRET": rec.api_key };
-    const body = JSON.stringify({ currency, mining_user_name: account, page: 1, size: 200 });
-    const { res: r, json: data } = await fetchJSON(url, { method: "POST", headers, body, timeout: 15000 }, 1);
+    const headers = {
+      "Content-Type": "application/json",
+      "F2P-API-SECRET": rec.api_key,
+    };
+    const body = JSON.stringify({
+      currency,
+      mining_user_name: account,
+      page: 1,
+      size: 200,
+    });
+    const { res: r, json: data } = await fetchJSON(
+      url,
+      { method: "POST", headers, body, timeout: 15000 },
+      1
+    );
     if (!r.ok || (data && typeof data.code === "number" && data.code !== 0)) {
       return { id: String(minerId), error: "f2_error" };
     }
-    const arr = Array.isArray(data?.workers) ? data.workers
-              : Array.isArray(data?.data?.workers) ? data.data.workers
-              : Array.isArray(data?.data?.list) ? data.data.list
-              : Array.isArray(data?.list) ? data.list
-              : [];
+    const arr = Array.isArray(data?.workers)
+      ? data.workers
+      : Array.isArray(data?.data?.workers)
+      ? data.data.workers
+      : Array.isArray(data?.data?.list)
+      ? data.data.list
+      : Array.isArray(data?.list)
+      ? data.list
+      : [];
     workers = arr.map((item) => {
-      const hri = item?.hash_rate_info || item?.hashrate_info || item?.hashRateInfo || {};
+      const hri =
+        item?.hash_rate_info ||
+        item?.hashrate_info ||
+        item?.hashRateInfo ||
+        {};
       const name = clean(hri?.name ?? item?.name ?? item?.worker ?? "");
-      const hr = Number(hri?.hash_rate ?? item?.hash_rate ?? item?.hashrate ?? 0);
-      const last = Number(item?.last_share_at ?? item?.last_share ?? item?.last_share_time ?? 0);
-      const lastMs = Number.isFinite(last) ? (last > 1e11 ? last : last * 1000) : 0;
-      const fresh = lastMs > 0 && (Date.now() - lastMs < 90 * 60 * 1000);
+      const hr = Number(
+        hri?.hash_rate ?? item?.hash_rate ?? item?.hashrate ?? 0
+      );
+      const last =
+        Number(item?.last_share_at ?? item?.last_share ?? item?.last_share_time ?? 0);
+      const lastMs = Number.isFinite(last)
+        ? last > 1e11
+          ? last
+          : last * 1000
+        : 0;
+      const fresh = lastMs > 0 && Date.now() - lastMs < 90 * 60 * 1000;
       const online = hr > 0 || fresh;
-      return { worker_name: name, worker_status: online ? "active" : "unactive", hashrate_10min: hr };
+      return {
+        worker_name: name,
+        worker_status: online ? "active" : "unactive",
+        hashrate_10min: hr,
+      };
     });
-
   } else if (pool === "MiningDutch") {
     const { account } = splitAccountWorker(worker_name_db);
     if (!account) return { id: String(minerId), error: "md_bad_worker" };
-    const urls = buildMDUrls({ coin, account_id: account, api_key: rec.api_key });
+    const urls = buildMDUrls({
+      coin,
+      account_id: account,
+      api_key: rec.api_key,
+    });
     let parsed = null;
     for (const url of urls) {
       const { res: r, json } = await fetchJSON(url, { timeout: 12000 }, 1);
       if (!r.ok) continue;
       const list = parseMDWorkersPayload(json);
-      if (Array.isArray(list)) { parsed = list; break; }
+      if (Array.isArray(list)) {
+        parsed = list;
+        break;
+      }
     }
     if (!parsed) return { id: String(minerId), error: "md_error" };
     workers = parsed.map((w, i) => ({
       worker_name: String(w?.username ?? `w${i}`),
-      worker_status: (Number(w?.alive ?? 0) > 0 || Number(w?.hashrate ?? 0) > 0) ? "active" : "unactive",
+      worker_status:
+        Number(w?.alive ?? 0) > 0 || Number(w?.hashrate ?? 0) > 0
+          ? "active"
+          : "unactive",
       hashrate_10min: Number(w?.hashrate ?? 0),
     }));
-
   } else {
     return { id: String(minerId), error: "unsupported_pool" };
   }
 
-  // pick worker by tail/tailKey
+  // pick worker por tail
   const expectedTailStr = tail(rec.worker_name);
-  const expectedKeyStr  = tailKey(rec.worker_name);
+  const expectedKeyStr = tailKey(rec.worker_name);
   const my =
-    workers.find(w => tail(w.worker_name) === expectedTailStr) ||
-    workers.find(w => tailKey(w.worker_name) === expectedKeyStr) || null;
+    workers.find((w) => tail(w.worker_name) === expectedTailStr) ||
+    workers.find((w) => tailKey(w.worker_name) === expectedKeyStr) ||
+    null;
 
-  // === NORMALIZAÇÃO FINAL (é ISTO que o front espera!) ===
   const worker_status = my ? normalizeStatus(my.worker_status) : "offline";
   const hashrate_10min = my ? Number(my.hashrate_10min ?? 0) : 0;
-
-  // power/watts se a pool der (quase nenhuma dá; deixamos null)
-  const power = null, watts = null;
 
   return {
     id: String(minerId),
     worker_status,
     hashrate_10min,
-    power,
-    watts,
-    // (meta opcional para debug)
+    power: null,
+    watts: null,
     source,
     worker_found: !!my,
   };
@@ -363,7 +437,7 @@ export async function getMinerStatus(req, res) {
     String(req.headers["x-refresh"] ?? "") === "1";
 
   const cache = statusCache.get(id);
-  if (!wantRefresh && cache && (Date.now() - cache.ts) < CACHE_TTL_MS) {
+  if (!wantRefresh && cache && Date.now() - cache.ts < CACHE_TTL_MS) {
     return res.json(cache.data);
   }
 
@@ -377,42 +451,88 @@ export async function getMinerStatus(req, res) {
   }
 }
 
-/* ========= Batch endpoint ========= */
+/* ========= Batch endpoint (OTIMIZADO) ========= */
 export async function getMinersStatusMany(req, res) {
   const raw = String(req.query.ids ?? "").trim();
   if (!raw) return res.status(400).json({ error: "ids vazios" });
   const ids = raw.split(",").map((s) => s.trim()).filter(Boolean);
 
-  // usa cache quando possível
+  const now = Date.now();
   const out = [];
   const toFetch = [];
-  const now = Date.now();
 
+  // 1) tenta cache primeiro
   for (const id of ids) {
     const c = statusCache.get(id);
-    if (c && (now - c.ts) < CACHE_TTL_MS) out.push(c.data);
-    else toFetch.push(id);
+    if (c && now - c.ts < CACHE_TTL_MS) {
+      out.push(c.data);
+    } else {
+      toFetch.push(id);
+    }
+  }
+
+  // 2) se não há nada para ir buscar → devolve já
+  if (!toFetch.length) {
+    // manter ordem
+    const map = new Map(out.map((o) => [o.id, o]));
+    const ordered = ids.map(
+      (id) =>
+        map.get(id) || {
+          id,
+          worker_status: "offline",
+          hashrate_10min: 0,
+          power: null,
+          watts: null,
+        }
+    );
+    return res.json(ordered);
   }
 
   try {
-    if (toFetch.length) {
-      // carga limitada
-      const CONC = 4;
-      const queue = [...toFetch];
-      async function worker() {
-        while (queue.length) {
-          const id = queue.shift();
-          if (!id) break;
-          const data = await fetchMinerStatusNormalized(id);
-          statusCache.set(id, { data, ts: Date.now() });
-          out.push(data);
-        }
-      }
-      await Promise.all(Array.from({ length: CONC }, () => worker()));
+    // 3) ir ao DB buscar TODOS de uma vez
+    const rows = await sql`
+      SELECT id, api_key, secret_key, coin, pool, worker_name
+      FROM miners
+      WHERE id::text = ANY(${toFetch})
+    `;
+    const mapMiner = new Map(
+      rows.map((r) => [String(r.id), r])
+    );
+
+    // 4) correr em paralelo mas com CONC limitado
+    const CONC = 4; // não subas isto sem meter queue
+    const queue = [...toFetch];
+    const promises = [];
+
+    for (let i = 0; i < CONC; i++) {
+      promises.push(
+        (async () => {
+          while (queue.length) {
+            const id = queue.shift();
+            if (!id) break;
+            const rec = mapMiner.get(String(id)) || null;
+            const data = await fetchMinerStatusNormalized(id, rec);
+            statusCache.set(String(id), { data, ts: Date.now() });
+            out.push(data);
+          }
+        })()
+      );
     }
-    // garante mesma ordem dos ids
-    const map = new Map(out.map(o => [o.id, o]));
-    const ordered = ids.map(id => map.get(id) || { id, worker_status: "offline", hashrate_10min: 0, power: null, watts: null });
+
+    await Promise.all(promises);
+
+    // 5) devolver na mesma ordem
+    const mapOut = new Map(out.map((o) => [o.id, o]));
+    const ordered = ids.map(
+      (id) =>
+        mapOut.get(id) || {
+          id,
+          worker_status: "offline",
+          hashrate_10min: 0,
+          power: null,
+          watts: null,
+        }
+    );
     res.json(ordered);
   } catch (e) {
     console.error("getMinersStatusMany error:", e);
