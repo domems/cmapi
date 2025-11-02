@@ -19,7 +19,7 @@ import notificationsRouter from "./routes/notifications.js";
 import pushRouter from "./routes/push.js";
 import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
-import { adminOnly } from "./middleware/adminOnly.js";
+import adminOnly from "./middleware/adminOnly.js";
 
 import { preListCache } from "./middleware/preListCache.js";       // <<< mantém
 import { listarMinersPorUser } from "./controllers/minersController.js";
