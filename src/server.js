@@ -7,10 +7,11 @@ import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import pino from "pino";
 import pinoHttp from "pino-http";
 import { clerkMiddleware, requireAuth } from "@clerk/express";
-
+import { adminOrStaffOnly } from "./middleware/roles.js";
 import { startAllJobs } from "./jobs/index.js";
 import { sql } from "./config/db.js";
-
+import staffRouter from "./routes/staff.js";
+import { staffOrAdmin } from "./middleware/staffOnly.js";
 import rateLimiter from "./middleware/rateLimiter.js";
 import { preListCache } from "./middleware/preListCache.js";
 import { listarMinersPorUser } from "./controllers/minersController.js";
@@ -178,8 +179,11 @@ app.use("/api", requireAuth(), userScope, prefsRouter);
 app.use("/api/auth", authRouter);
 
 // rotas ADMIN (sessão + role na Clerk)
-app.use("/api/admin", requireAuth(), adminOnly, minersAdminRoutes);
-app.use("/api/admin", requireAuth(), adminOnly, adminInvoicesRouter);
+app.use("/api/admin", requireAuth(), adminOrStaffOnly, minersAdminRoutes);
+app.use("/api/admin", requireAuth(), adminOrStaffOnly, adminInvoicesRouter);
+
+// rotas STAFF (sessão + role)
+app.use("/api/staff", requireAuth(), staffOrAdmin(), staffRouter);
 
 // raiz/health (silenciosos e cacheáveis)
 app.get("/", (_req, res) => {
