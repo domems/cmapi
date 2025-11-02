@@ -43,15 +43,19 @@ export async function statsMiners(_req, res) {
         COUNT(*)::int AS total,
         SUM(
           CASE
-            WHEN (NULLIF(TRIM(hash_rate), '') IS NOT NULL AND
-                  TRY_CAST(REPLACE(hash_rate, ',', '.') AS DOUBLE PRECISION) > 0) THEN 1
-            WHEN LOWER(COALESCE(status,'')) IN ('online','active','up','1','true') THEN 1
+            WHEN NULLIF(TRIM(hash_rate), '') IS NOT NULL
+             AND hash_rate ~ '^[0-9]+([.,][0-9]+)?$'
+             AND REPLACE(hash_rate, ',', '.')::double precision > 0
+              THEN 1
+            WHEN LOWER(COALESCE(status,'')) IN ('online','active','up','1','true')
+              THEN 1
             ELSE 0
           END
         )::int AS online,
         SUM(
           CASE
-            WHEN LOWER(COALESCE(status,'')) ~ '^(maint|manuten|restarting|rebooting|upgrading)' THEN 1
+            WHEN LOWER(COALESCE(status,'')) ~ '^(maint|manuten|restarting|rebooting|upgrading)'
+              THEN 1
             ELSE 0
           END
         )::int AS maintenance
@@ -68,6 +72,7 @@ export async function statsMiners(_req, res) {
     res.status(500).json({ error: "failed_stats_miners" });
   }
 }
+
 
 /* ---------- Resumo mês corrente (direto da tabela) ---------- */
 export async function currentSummary(_req, res) {
@@ -227,20 +232,26 @@ export async function obterStatusBatch(req, res) {
     const MAX_IDS = 500;
     const idsCapped = ids.slice(0, MAX_IDS);
 
-    const rows = await sql/*sql*/`
-      SELECT id, hash_rate, status
-      FROM miners
-      WHERE id = ANY(${sql.array(idsCapped)})
-      ORDER BY id ASC
-    `;
+    const rows = await sql.unsafe(
+      `
+        SELECT id, hash_rate, status
+        FROM miners
+        WHERE id = ANY($1::int[])
+        ORDER BY id ASC
+      `,
+      [idsCapped]
+    );
 
-    const out = rows.map(r => {
-      const hr = numFromText(r.hash_rate);
-      const ws = String(r.status ?? "");
+    const out = (Array.isArray(rows) ? rows : rows?.rows || []).map((r) => {
+      const hrText = r.hash_rate ?? "";
+      const hr =
+        typeof hrText === "string" && /^[0-9]+([.,][0-9]+)?$/.test(hrText)
+          ? Number(hrText.replace(",", "."))
+          : 0;
       return {
         id: Number(r.id),
-        hashrate_10min: hr,     // o teu frontend usa isto
-        worker_status: ws,      // e isto
+        hashrate_10min: Number.isFinite(hr) ? hr : 0,
+        worker_status: String(r.status ?? ""),
         power: null,
         watts: null,
       };
@@ -252,6 +263,8 @@ export async function obterStatusBatch(req, res) {
     return res.status(500).json({ error: err.message || "Erro ao obter status (batch)." });
   }
 }
+
+
 
 export async function obterStatusPorId(req, res) {
   try {
