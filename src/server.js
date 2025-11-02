@@ -2,10 +2,11 @@
 import express from "express";
 import dotenv from "dotenv";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
-import { clerkMiddleware } from "@clerk/express";
+import { clerkMiddleware, requireAuth } from "@clerk/express";
 import { startAllJobs } from "./jobs/index.js";
 import { sql } from "./config/db.js";
-import rateLimiter from "./middleware/rateLimiter.js";            // o teu limiter global (mantém)
+import rateLimiter from "./middleware/rateLimiter.js";
+
 import minerRoutes from "./routes/minersRoutes.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
 import statusRoutes from "./routes/statusRoutes.js";
@@ -20,8 +21,8 @@ import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
 import { adminOnly } from "./middleware/adminOnly.js";
 
-import { preListCache } from "./middleware/preListCache.js";       // <<< NOVO (diretório singular!)
-import { listarMinersPorUser } from "./controllers/minersController.js"; // handler concreto
+import { preListCache } from "./middleware/preListCache.js";       // <<< mantém
+import { listarMinersPorUser } from "./controllers/minersController.js";
 
 dotenv.config();
 
@@ -53,7 +54,7 @@ const minersListLimiter = rateLimit({
     if (req.headers["x-user-email"]) {
       return `email:${String(req.headers["x-user-email"]).toLowerCase()}`;
     }
-    // usa helper IPv6-safe
+    // IPv6-safe
     return ipKeyGenerator(req);
   },
 
@@ -66,7 +67,6 @@ const minersListLimiter = rateLimit({
   skip: (req) => req.method === "OPTIONS" || req.method === "HEAD",
 });
 
-
 // ⚠️ IMPORTANTE: esta rota vem ANTES do limiter global
 app.get("/api/miners/user/:userId", preListCache(), minersListLimiter, listarMinersPorUser);
 
@@ -74,23 +74,28 @@ app.get("/api/miners/user/:userId", preListCache(), minersListLimiter, listarMin
 // Limiter global (aplica-se a tudo o resto)
 app.use(rateLimiter);
 
-// ---- rotas públicas/gerais ----
+// ---- rotas públicas/gerais (ou que precisam de exceções) ----
 app.use("/api/clerk", clerkRoutes);
-app.use("/api/miners", minerRoutes); // mantém as outras rotas de miners
-app.use("/api", statusRoutes);
-app.use("/api", storeMinersRoutes);
-app.use("/api", invoicesRoutes);
-app.use("/api", paymentsRoutes);
-app.use("/api", notificationsRouter);
-app.use("/api", pushRouter);
-app.use("/api", prefsRouter);
 
-// bootstrap de roles
-app.use("/api/auth", authRouter);
+// Pagamentos: mantém sem requireAuth para não partir o webhook.
+// (Dentro do router, protege endpoints sensíveis; o webhook fica público.)
+app.use("/api", paymentsRoutes);
+
+// ---- rotas autenticadas (Clerk requireAuth) ----
+app.use("/api/miners", requireAuth(), minerRoutes);
+app.use("/api", requireAuth(), statusRoutes);
+app.use("/api", requireAuth(), storeMinersRoutes);
+app.use("/api", requireAuth(), invoicesRoutes);
+app.use("/api", requireAuth(), notificationsRouter);
+app.use("/api", requireAuth(), pushRouter);
+app.use("/api", requireAuth(), prefsRouter);
+
+// Bootstrap/gestão de roles (restrito a admin)
+app.use("/api/auth", requireAuth(), adminOnly, authRouter);
 
 // ---- rotas ADMIN (protegidas) ----
-app.use("/api/admin", adminOnly, minersAdminRoutes);
-app.use("/api/admin", adminOnly, adminInvoicesRouter);
+app.use("/api/admin", requireAuth(), adminOnly, minersAdminRoutes);
+app.use("/api/admin", requireAuth(), adminOnly, adminInvoicesRouter);
 
 // raiz/health
 app.get("/", (_req, res) => res.send("Its working"));
