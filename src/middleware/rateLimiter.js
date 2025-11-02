@@ -1,23 +1,18 @@
-import ratelimit from "../config/upstash.js";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 
-const rateLimiter = async (req, res, next) => {
-  try {
-    const { success } = await ratelimit.limit("my-rate-limit");
+/** Limiter global sensato.
+ *  Chave por userId quando autenticado, senão IP (com proxy trust).
+ */
+const limiter = rateLimit({
+  windowMs: 60_000,
+  limit: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    if (req.auth?.userId) return `uid:${req.auth.userId}`;
+    return ipKeyGenerator(req);
+  },
+  skip: (req) => req.method === "OPTIONS" || req.method === "HEAD",
+});
 
-    if (!success) {
-      return res.status(429).json({
-        message: "Too many requests, please try again later :)",
-      });
-    }
-
-    next(); // continua para o próximo middleware
-
-  } catch (error) {
-    console.log("Rate limit error", error);
-    next(error); // passa o erro para o Express
-  }
-};
-
-export default rateLimiter;
-
-
+export default limiter;
