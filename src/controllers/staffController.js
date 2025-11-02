@@ -224,3 +224,82 @@ export async function obterStatusPorId(req, res) {
     res.status(err?.status || 500).json({ error: err.message || "Erro ao obter status." });
   }
 }
+
+
+// --- no topo do ficheiro já tens: import { sql } from "../config/db.js";
+
+/* =========================
+ * Miner State Events (lista global)
+ * ========================= */
+function parseIntQP(v, def) {
+  const n = Number.parseInt(String(v ?? ""), 10);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+function parseISODate(v) {
+  const s = String(v || "").trim();
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? new Date(t) : null;
+}
+
+/**
+ * GET /api/staff/miner-state-events
+ * Query:
+ *  - page, pageSize (ou limit/offset)
+ *  - minerId (opcional)
+ *  - from (ISO) / to (ISO) por occurred_at_utc
+ *  - state (filtra por to_state)
+ *  - order = desc|asc (default desc)
+ * Resposta: { items, page, pageSize, total }
+ */
+export async function listarMinerStateEvents(req, res) {
+  try {
+    const page = parseIntQP(req.query.page, 1);
+    const pageSize = Math.min(200, parseIntQP(req.query.pageSize ?? req.query.limit, 30));
+    const offset =
+      req.query.offset != null
+        ? Math.max(0, Number.parseInt(String(req.query.offset), 10) || 0)
+        : (page - 1) * pageSize;
+
+    const minerId = req.query.minerId != null ? Number.parseInt(String(req.query.minerId), 10) : null;
+    const from = parseISODate(req.query.from);
+    const to = parseISODate(req.query.to);
+    const state = String(req.query.state || "").trim().toUpperCase();
+    const order = String(req.query.order || "desc").toLowerCase() === "asc" ? sql`ASC` : sql`DESC`;
+
+    const where = [];
+    if (Number.isFinite(minerId)) where.push(sql`miner_id = ${minerId}`);
+    if (from) where.push(sql`occurred_at_utc >= ${from.toISOString()}`);
+    if (to) where.push(sql`occurred_at_utc <= ${to.toISOString()}`);
+    if (state && ["ONLINE","OFFLINE","MAINTENANCE","STALE"].includes(state)) {
+      where.push(sql`UPPER(to_state) = ${state}`);
+    }
+
+    const whereSql = where.length ? where.reduce((acc, frag, i) => (i ? sql`${acc} AND ${frag}` : frag), sql``) : sql`TRUE`;
+
+    const [items, totalRow] = await Promise.all([
+      sql/*sql*/`
+        SELECT id, miner_id, from_state, to_state, slot_iso, occurred_at_utc, reason
+        FROM miner_state_events
+        WHERE ${whereSql}
+        ORDER BY occurred_at_utc ${order}, id ${order}
+        LIMIT ${pageSize} OFFSET ${offset}
+      `,
+      sql/*sql*/`
+        SELECT COUNT(*)::int AS total
+        FROM miner_state_events
+        WHERE ${whereSql}
+      `,
+    ]);
+
+    res.json({
+      items,
+      page,
+      pageSize,
+      total: totalRow?.[0]?.total ?? items.length,
+    });
+  } catch (err) {
+    console.error("staff.listarMinerStateEvents:", err);
+    res.status(500).json({ error: "Erro ao listar eventos." });
+  }
+}

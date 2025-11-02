@@ -9,6 +9,7 @@ import {
   listarMinersGlobais,
   obterStatusBatch,
   obterStatusPorId,
+  listarMinerStateEvents,
 } from "../controllers/staffController.js";
 
 const router = Router();
@@ -34,5 +35,7 @@ router.get("/miners", listarMinersGlobais);
 // Status helpers (batch e por ID)
 router.get("/miners-status", obterStatusBatch);
 router.get("/miners/:id/status", obterStatusPorId);
+
+router.get("/miner-state-events", listarMinerStateEvents);
 
 export default router;
