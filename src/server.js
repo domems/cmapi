@@ -21,7 +21,7 @@ import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
 import adminOnly from "./middleware/adminOnly.js";
 
-import { preListCache } from "./middleware/preListCache.js";       // <<< mantém
+import { preListCache } from "./middleware/preListCache.js";
 import { listarMinersPorUser } from "./controllers/minersController.js";
 
 dotenv.config();
@@ -30,7 +30,6 @@ const PORT = process.env.PORT || 5001;
 const app = express();
 
 /* ================= Clerk e body parsers ================= */
-// Clerk primeiro (popular req.auth)
 app.use(clerkMiddleware());
 
 // raw body só no webhook NOWPayments (ANTES do json)
@@ -39,46 +38,47 @@ app.use("/api/payments/webhook/nowpayments", express.raw({ type: "*/*" }));
 // JSON parser para o resto
 app.use(express.json());
 
-/* ================= Rota especial com pré-cache antes do limiter =================
-   — Serve 304/200 a partir de cache sem “gastar” rate-limit.
-   — Se não houver cache fresco, cai no handler normal com um limiter dedicado.
+/* ================= Rota especial com pré-cache =================
+   Repara: agora tem requireAuth() ANTES do handler
 */
 const minersListLimiter = rateLimit({
   windowMs: 60_000,
   limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
-
   keyGenerator: (req) => {
     if (req.params?.userId) return `user:${req.params.userId}`;
     if (req.headers["x-user-email"]) {
       return `email:${String(req.headers["x-user-email"]).toLowerCase()}`;
     }
-    // IPv6-safe
     return ipKeyGenerator(req);
   },
-
   handler: (req, res) => {
-    const retry = 60; // segundos
+    const retry = 60;
     res.setHeader("Retry-After", String(retry));
     res.status(429).json({ message: "Too many requests, please try again later :)" });
   },
-
   skip: (req) => req.method === "OPTIONS" || req.method === "HEAD",
 });
 
-// ⚠️ IMPORTANTE: esta rota vem ANTES do limiter global
-app.get("/api/miners/user/:userId", preListCache(), minersListLimiter, listarMinersPorUser);
+// ⚠️ Pré-cache -> limiter -> requireAuth -> handler
+app.get(
+  "/api/miners/user/:userId",
+  preListCache(),
+  minersListLimiter,
+  requireAuth(),
+  listarMinersPorUser
+);
 
 /* ================= Middlewares/rotas do resto da app ================= */
 // Limiter global (aplica-se a tudo o resto)
 app.use(rateLimiter);
 
-// ---- rotas públicas/gerais (ou que precisam de exceções) ----
+// ---- rotas públicas/gerais ----
 app.use("/api/clerk", clerkRoutes);
 
 // Pagamentos: mantém sem requireAuth para não partir o webhook.
-// (Dentro do router, protege endpoints sensíveis; o webhook fica público.)
+// (Protege endpoints sensíveis DENTRO do router de payments.)
 app.use("/api", paymentsRoutes);
 
 // ---- rotas autenticadas (Clerk requireAuth) ----
