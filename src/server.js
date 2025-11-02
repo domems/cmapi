@@ -2,11 +2,10 @@
 import express from "express";
 import dotenv from "dotenv";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
-import { clerkMiddleware, requireAuth } from "@clerk/express";
+import { clerkMiddleware } from "@clerk/express";
 import { startAllJobs } from "./jobs/index.js";
 import { sql } from "./config/db.js";
-import rateLimiter from "./middleware/rateLimiter.js";
-
+import rateLimiter from "./middleware/rateLimiter.js";            // o teu limiter global (mantém)
 import minerRoutes from "./routes/minersRoutes.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
 import statusRoutes from "./routes/statusRoutes.js";
@@ -19,10 +18,10 @@ import notificationsRouter from "./routes/notifications.js";
 import pushRouter from "./routes/push.js";
 import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
-import adminOnly from "./middleware/adminOnly.js";
+import { adminOnly } from "./middleware/adminOnly.js";
 
-import { preListCache } from "./middleware/preListCache.js";
-import { listarMinersPorUser } from "./controllers/minersController.js";
+import { preListCache } from "./middleware/preListCache.js";       // <<< NOVO (diretório singular!)
+import { listarMinersPorUser } from "./controllers/minersController.js"; // handler concreto
 
 dotenv.config();
 
@@ -30,6 +29,7 @@ const PORT = process.env.PORT || 5001;
 const app = express();
 
 /* ================= Clerk e body parsers ================= */
+// Clerk primeiro (popular req.auth)
 app.use(clerkMiddleware());
 
 // raw body só no webhook NOWPayments (ANTES do json)
@@ -38,37 +38,37 @@ app.use("/api/payments/webhook/nowpayments", express.raw({ type: "*/*" }));
 // JSON parser para o resto
 app.use(express.json());
 
-/* ================= Rota especial com pré-cache =================
-   Repara: agora tem requireAuth() ANTES do handler
+/* ================= Rota especial com pré-cache antes do limiter =================
+   — Serve 304/200 a partir de cache sem “gastar” rate-limit.
+   — Se não houver cache fresco, cai no handler normal com um limiter dedicado.
 */
 const minersListLimiter = rateLimit({
   windowMs: 60_000,
   limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
+
   keyGenerator: (req) => {
     if (req.params?.userId) return `user:${req.params.userId}`;
     if (req.headers["x-user-email"]) {
       return `email:${String(req.headers["x-user-email"]).toLowerCase()}`;
     }
+    // usa helper IPv6-safe
     return ipKeyGenerator(req);
   },
+
   handler: (req, res) => {
-    const retry = 60;
+    const retry = 60; // segundos
     res.setHeader("Retry-After", String(retry));
     res.status(429).json({ message: "Too many requests, please try again later :)" });
   },
+
   skip: (req) => req.method === "OPTIONS" || req.method === "HEAD",
 });
 
-// ⚠️ Pré-cache -> limiter -> requireAuth -> handler
-app.get(
-  "/api/miners/user/:userId",
-  preListCache(),
-  minersListLimiter,
-  requireAuth(),
-  listarMinersPorUser
-);
+
+// ⚠️ IMPORTANTE: esta rota vem ANTES do limiter global
+app.get("/api/miners/user/:userId", preListCache(), minersListLimiter, listarMinersPorUser);
 
 /* ================= Middlewares/rotas do resto da app ================= */
 // Limiter global (aplica-se a tudo o resto)
@@ -76,26 +76,21 @@ app.use(rateLimiter);
 
 // ---- rotas públicas/gerais ----
 app.use("/api/clerk", clerkRoutes);
-
-// Pagamentos: mantém sem requireAuth para não partir o webhook.
-// (Protege endpoints sensíveis DENTRO do router de payments.)
+app.use("/api/miners", minerRoutes); // mantém as outras rotas de miners
+app.use("/api", statusRoutes);
+app.use("/api", storeMinersRoutes);
+app.use("/api", invoicesRoutes);
 app.use("/api", paymentsRoutes);
+app.use("/api", notificationsRouter);
+app.use("/api", pushRouter);
+app.use("/api", prefsRouter);
 
-// ---- rotas autenticadas (Clerk requireAuth) ----
-app.use("/api/miners", requireAuth(), minerRoutes);
-app.use("/api", requireAuth(), statusRoutes);
-app.use("/api", requireAuth(), storeMinersRoutes);
-app.use("/api", requireAuth(), invoicesRoutes);
-app.use("/api", requireAuth(), notificationsRouter);
-app.use("/api", requireAuth(), pushRouter);
-app.use("/api", requireAuth(), prefsRouter);
-
-// Bootstrap/gestão de roles (restrito a admin)
-app.use("/api/auth", requireAuth(), adminOnly, authRouter);
+// bootstrap de roles
+app.use("/api/auth", authRouter);
 
 // ---- rotas ADMIN (protegidas) ----
-app.use("/api/admin", requireAuth(), adminOnly, minersAdminRoutes);
-app.use("/api/admin", requireAuth(), adminOnly, adminInvoicesRouter);
+app.use("/api/admin", adminOnly, minersAdminRoutes);
+app.use("/api/admin", adminOnly, adminInvoicesRouter);
 
 // raiz/health
 app.get("/", (_req, res) => res.send("Its working"));
