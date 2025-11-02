@@ -1,7 +1,7 @@
 // src/controllers/staffController.js
 import { sql } from "../config/db.js";
 
-/* ---------- Utils ---------- */
+/* -------------------- Utils -------------------- */
 function parsePaging(req) {
   const page = Math.max(1, Number(req.query.page || 1));
   const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || req.query.limit || 20)));
@@ -18,31 +18,71 @@ function parseCoinQuery(req) {
   return coin && COIN_WHITELIST.includes(coin) ? coin : null;
 }
 
-/* ---------- Health ---------- */
+function parseIntQP(v, def) {
+  const n = Number.parseInt(String(v ?? ""), 10);
+  return Number.isFinite(n) && n > 0 ? n : def;
+}
+function parseISODate(v) {
+  const s = String(v || "").trim();
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? new Date(t) : null;
+}
+
+/* -------------------- Health -------------------- */
 export async function ping(_req, res) {
   res.json({ ok: true, ts: new Date().toISOString() });
 }
 
-/* ---------- KPIs de Miners ---------- */
+/* -------------------- KPIs (ONLINE/MAINT/OFFLINE) -------------------- */
+/**
+ * Regras:
+ *  - Se houver payload na cache (miner_status_cache), usamos:
+ *      hr = max(hashrate_10min, hashrate_10m, hashrate_5m, hashrate_30m, hashrate, hr, hash)
+ *      online se hr > 0
+ *      maintenance se worker_status ~ 'maint*|rebooting|upgrading'
+ *  - Caso contrário, caímos no campo miners.status (best effort)
+ */
 export async function statsMiners(_req, res) {
   try {
-    const [row] = await sql/*sql*/`
+    const rows = await sql/*sql*/`
+      WITH cache AS (
+        SELECT
+          m.id,
+          (payload->>'hashrate_10min')::float AS hr10,
+          (payload->>'hashrate_10m')::float AS hr10m,
+          (payload->>'hashrate_5m')::float AS hr5,
+          (payload->>'hashrate_30m')::float AS hr30,
+          (payload->>'hashrate')::float AS hr,
+          (payload->>'hr')::float AS hr_alt,
+          (payload->>'hash')::float AS hr_alt2,
+          LOWER(COALESCE(payload->>'worker_status', payload->>'status', payload->>'state')) AS ws,
+          s.updated_at
+        FROM miners m
+        LEFT JOIN miner_status_cache s ON s.miner_id = m.id
+      )
       SELECT
-        COALESCE(SUM(
-          CASE
-            WHEN LOWER(COALESCE(status,'')) LIKE '%maint%' THEN 1
-            WHEN LOWER(COALESCE(status,'')) IN ('online','active','up') THEN 1
-            WHEN COALESCE(status,'') IN ('1','true','TRUE') THEN 1
-            ELSE 0
-          END
-        ),0) AS online,
-        COALESCE(SUM(CASE WHEN LOWER(COALESCE(status,'')) LIKE '%maint%' THEN 1 ELSE 0 END),0) AS maintenance,
-        COALESCE(COUNT(*),0) AS total
-      FROM miners;
+        COALESCE(SUM(CASE
+          WHEN GREATEST(COALESCE(hr10,0),COALESCE(hr10m,0),COALESCE(hr5,0),COALESCE(hr30,0),COALESCE(hr,0),COALESCE(hr_alt,0),COALESCE(hr_alt2,0)) > 0
+            THEN 1
+          WHEN ws ~ '^(alive|running|ok|online|up|ativo|ligado|ativa)$'
+            THEN 1
+          WHEN (SELECT LOWER(COALESCE(status,'')) FROM miners WHERE id = cache.id) IN ('online','active','up','1','true')
+            THEN 1
+          ELSE 0
+        END),0) AS online,
+        COALESCE(SUM(CASE
+          WHEN ws ~ '^(maint|manuten|restarting|rebooting|upgrading)'
+            THEN 1
+          ELSE 0
+        END),0) AS maintenance,
+        COUNT(*)::int AS total
+      FROM cache;
     `;
-    const online = Number(row?.online || 0);
-    const maintenance = Number(row?.maintenance || 0);
-    const total = Number(row?.total || 0);
+    const r = rows?.[0] || {};
+    const online = Number(r.online || 0);
+    const maintenance = Number(r.maintenance || 0);
+    const total = Number(r.total || 0);
     const offline = Math.max(0, total - online - maintenance);
     res.json({ online, offline, maintenance, total });
   } catch (err) {
@@ -51,7 +91,7 @@ export async function statsMiners(_req, res) {
   }
 }
 
-/* ---------- Resumo global do mês corrente ---------- */
+/* -------------------- Resumo global mês corrente -------------------- */
 export async function currentSummary(_req, res) {
   try {
     const [row] = await sql/*sql*/`
@@ -72,7 +112,7 @@ export async function currentSummary(_req, res) {
   }
 }
 
-/* ---------- Lista global de faturas (+ opcional em_curso sintético) ---------- */
+/* -------------------- Lista global de faturas -------------------- */
 export async function listarFaturasGlobais(req, res) {
   const includeCurrent = String(req.query.includeCurrent || req.query.include_current || "0") === "1";
   try {
@@ -131,7 +171,7 @@ export async function listarFaturasGlobais(req, res) {
   }
 }
 
-/* ---------- Contador global de notificações por ler ---------- */
+/* -------------------- Contador global de notificações -------------------- */
 export async function notificationsUnreadCount(_req, res) {
   try {
     const rows = await sql/*sql*/`
@@ -141,13 +181,12 @@ export async function notificationsUnreadCount(_req, res) {
     `;
     const count = Number(rows?.[0]?.count || 0);
     res.json({ count });
-  } catch (err) {
-    // Se não existir tabela/coluna, devolve 0 (não parte a UI)
+  } catch (_err) {
     res.json({ count: 0 });
   }
 }
 
-/* ---------- Listagem de miners (global) com ETag ---------- */
+/* -------------------- Listagem de miners (com ETag/paginação) -------------------- */
 export async function listarMinersGlobais(req, res) {
   try {
     const coin = parseCoinQuery(req);
@@ -166,8 +205,20 @@ export async function listarMinersGlobais(req, res) {
     const inm = String(req.headers["if-none-match"] || "");
     if (inm && inm === etag) return res.status(304).end();
 
+    // Evita SELECT *: mapeia só o que o app usa
     const items = await sql/*sql*/`
-      SELECT *
+      SELECT
+        id,
+        worker_name,
+        nome,
+        modelo,
+        COALESCE(hash_rate, NULL) AS hash_rate,
+        COALESCE(status, NULL) AS status,
+        coin,
+        pool,
+        owner_email,
+        created_at,
+        updated_at
       FROM miners
       ${whereCoin}
       ORDER BY ${ORDER_BY_RECENTE}
@@ -181,25 +232,59 @@ export async function listarMinersGlobais(req, res) {
   }
 }
 
-/* ---------- Status helpers (leitura) ---------- */
+/* -------------------- Status helpers -------------------- */
+/**
+ * 🔥 O teu frontend espera payload com campos usados no cálculo:
+ *  - hashrate_10min / 10m / 5m / 30m / hashrate / hr / hash
+ *  - worker_status
+ *  - power / watts
+ * Devolve isso da TABELA DE CACHE (jsonb). Se não existir, cai para miners.status minimal.
+ */
 export async function obterStatusBatch(req, res) {
   try {
     const raw = String(req.query.ids || "").trim();
     const ids = raw ? raw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Number.isFinite) : [];
     if (!ids.length) return res.json([]);
+
     const MAX_IDS = 500;
     const idsCapped = ids.slice(0, MAX_IDS);
-    const result = await sql.unsafe(
-      `
-      SELECT id, COALESCE(status, 'offline') AS status
-      FROM miners
-      WHERE id = ANY($1::int[])
-      ORDER BY id ASC
-      `,
-      [idsCapped]
-    );
-    const rows = Array.isArray(result) ? result : Array.isArray(result?.rows) ? result.rows : [];
-    return res.json(rows.map((r) => ({ id: Number(r.id), status: String(r.status) })));
+
+    const rows = await sql/*sql*/`
+      SELECT
+        m.id,
+        c.payload,
+        m.status AS fallback_status
+      FROM miners m
+      LEFT JOIN miner_status_cache c ON c.miner_id = m.id
+      WHERE m.id = ANY(${sql.array(idsCapped)})
+      ORDER BY m.id ASC
+    `;
+
+    const out = rows.map((r) => {
+      const id = Number(r.id);
+      const payload = r.payload || null;
+      if (payload && typeof payload === "object") {
+        return {
+          id,
+          hashrate_10min: Number(payload.hashrate_10min ?? payload.hashrate_10m ?? payload.hashrate ?? payload.hr ?? payload.hash ?? 0) || 0,
+          worker_status: String(payload.worker_status ?? payload.status ?? payload.state ?? ""),
+          power: payload.power ?? payload.watts ?? null,
+          watts: payload.watts ?? payload.power ?? null,
+          // devolve tudo para o app ter liberdade
+          ...payload,
+        };
+      }
+      // fallback minimal
+      return {
+        id,
+        hashrate_10min: 0,
+        worker_status: String(r.fallback_status ?? "offline"),
+        power: null,
+        watts: null,
+      };
+    });
+
+    return res.json(out);
   } catch (err) {
     console.error("staff.obterStatusBatch:", err);
     const status = err?.status || 500;
@@ -211,47 +296,45 @@ export async function obterStatusPorId(req, res) {
   try {
     const id = parseInt(String(req.params.id || ""), 10);
     if (!Number.isFinite(id)) return res.status(400).json({ error: "ID inválido." });
+
     const rows = await sql/*sql*/`
-      SELECT id, COALESCE(status, 'offline') AS status
-      FROM miners
-      WHERE id = ${id}
+      SELECT
+        m.id,
+        c.payload,
+        m.status AS fallback_status
+      FROM miners m
+      LEFT JOIN miner_status_cache c ON c.miner_id = m.id
+      WHERE m.id = ${id}
       LIMIT 1
     `;
     if (!rows.length) return res.status(404).json({ error: "Miner não encontrada." });
-    res.json({ id: rows[0].id, status: rows[0].status });
+    const r = rows[0];
+    const payload = r.payload || null;
+
+    if (payload && typeof payload === "object") {
+      return res.json({
+        id: Number(r.id),
+        hashrate_10min: Number(payload.hashrate_10min ?? payload.hashrate_10m ?? payload.hashrate ?? payload.hr ?? payload.hash ?? 0) || 0,
+        worker_status: String(payload.worker_status ?? payload.status ?? payload.state ?? ""),
+        power: payload.power ?? payload.watts ?? null,
+        watts: payload.watts ?? payload.power ?? null,
+        ...payload,
+      });
+    }
+    return res.json({
+      id: Number(r.id),
+      hashrate_10min: 0,
+      worker_status: String(r.fallback_status ?? "offline"),
+      power: null,
+      watts: null,
+    });
   } catch (err) {
     console.error("staff.obterStatusPorId:", err);
     res.status(err?.status || 500).json({ error: err.message || "Erro ao obter status." });
   }
 }
 
-
-// --- no topo do ficheiro já tens: import { sql } from "../config/db.js";
-
-/* =========================
- * Miner State Events (lista global)
- * ========================= */
-function parseIntQP(v, def) {
-  const n = Number.parseInt(String(v ?? ""), 10);
-  return Number.isFinite(n) && n > 0 ? n : def;
-}
-function parseISODate(v) {
-  const s = String(v || "").trim();
-  if (!s) return null;
-  const t = Date.parse(s);
-  return Number.isFinite(t) ? new Date(t) : null;
-}
-
-/**
- * GET /api/staff/miner-state-events
- * Query:
- *  - page, pageSize (ou limit/offset)
- *  - minerId (opcional)
- *  - from (ISO) / to (ISO) por occurred_at_utc
- *  - state (filtra por to_state)
- *  - order = desc|asc (default desc)
- * Resposta: { items, page, pageSize, total }
- */
+/* -------------------- Miner State Events -------------------- */
 export async function listarMinerStateEvents(req, res) {
   try {
     const page = parseIntQP(req.query.page, 1);
