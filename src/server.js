@@ -169,10 +169,10 @@ function userScope(req, _res, next) {
 }
 
 app.use("/api/miners", requireAuth(), userScope, minerRoutes);
-app.use("/api/invoices", requireAuth(), userScope, invoicesRoutes);
-app.use("/api/notifications", requireAuth(), userScope, notificationsRouter);
-app.use("/api/push", requireAuth(), userScope, pushRouter);
-app.use("/api/prefs", requireAuth(), userScope, prefsRouter);
+app.use("/api", requireAuth(), userScope, invoicesRoutes);
+app.use("/api", requireAuth(), userScope, notificationsRouter);
+app.use("/api", requireAuth(), userScope, pushRouter);
+app.use("/api", requireAuth(), userScope, prefsRouter);
 
 // bootstrap/roles (se manténs endpoints públicos aqui, ok)
 app.use("/api/auth", authRouter);
