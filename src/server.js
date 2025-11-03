@@ -275,14 +275,8 @@ async function initDB() {
 /* ================= Arranque ================= */
 initDB().then(() => {
   const server = app.listen(PORT, () => {
-    logger.info({ PORT }, "Server is up and running");
-    const RUN_JOBS = process.env.RUN_JOBS === "1";
-    if (RUN_JOBS) {
-      logger.info("Starting background jobs (RUN_JOBS=1)...");
-      startAllJobs();
-    } else {
-      logger.info("Background jobs disabled in this process (RUN_JOBS!=1)");
-    }
+    logger.info("Starting background jobs ...");
+    startAllJobs();
   });
 
   // timeouts para travar slowloris
