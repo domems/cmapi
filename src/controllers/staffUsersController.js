@@ -10,25 +10,59 @@ if (!CLERK_SECRET_KEY) {
   console.warn("[staffUsersController] Missing CLERK_SECRET_KEY env var");
 }
 
-/* ===== Tabela sombra (locked + role para fallback visual) ===== */
-// Neon serverless NÃO permite múltiplas statements no mesmo sql``.
-// Separa e corre só uma vez.
+/* ===== Tabela sombra (locked + role para fallback visual) =====
+   — Neon não aceita multi-statements preparados
+   — Pode existir TYPE órfão (mesmo nome) a bloquear CREATE TABLE
+   — Usa advisory lock para evitar race entre lambdas
+*/
 let _flagsInitDone = false;
+const LOCK_KEY = 684_221_337; // qualquer BIGINT estável
+
 async function ensureFlagsTableOnce() {
   if (_flagsInitDone) return;
-  await sql/*sql*/`
-    CREATE TABLE IF NOT EXISTS clerk_user_flags (
-      user_id TEXT PRIMARY KEY,
-      role TEXT NOT NULL DEFAULT 'user',
-      locked BOOLEAN NOT NULL DEFAULT FALSE,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )
-  `;
-  await sql/*sql*/`
-    CREATE INDEX IF NOT EXISTS clerk_user_flags_locked_idx
-    ON clerk_user_flags (locked)
-  `;
-  _flagsInitDone = true;
+
+  // lock global (processo concorrente? espera)
+  try { await sql/*sql*/`SELECT pg_advisory_lock(${LOCK_KEY}::bigint)`; } catch {}
+
+  try {
+    // já existe?
+    const existsRes = await sql/*sql*/`SELECT to_regclass('public.clerk_user_flags') AS rel`;
+    const rel = existsRes?.[0]?.rel;
+
+    if (!rel) {
+      // remove TYPE órfão que impede CREATE TABLE
+      // (se não existir, não faz nada)
+      await sql/*sql*/`DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_type t
+                   JOIN pg_namespace n ON n.oid = t.typnamespace
+                   WHERE t.typname = 'clerk_user_flags' AND n.nspname = 'public') THEN
+          -- tenta RESTRICT; se tiver dependências (improvável), não arrisca CASCADE
+          EXECUTE 'DROP TYPE public.clerk_user_flags';
+        END IF;
+      END$$;`;
+
+      // cria tabela (uma statement)
+      await sql/*sql*/`
+        CREATE TABLE IF NOT EXISTS public.clerk_user_flags (
+          user_id TEXT PRIMARY KEY,
+          role TEXT NOT NULL DEFAULT 'user',
+          locked BOOLEAN NOT NULL DEFAULT FALSE,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `;
+
+      // cria índice (nova statement)
+      await sql/*sql*/`
+        CREATE INDEX IF NOT EXISTS clerk_user_flags_locked_idx
+        ON public.clerk_user_flags (locked)
+      `;
+    }
+
+    _flagsInitDone = true;
+  } finally {
+    try { await sql/*sql*/`SELECT pg_advisory_unlock(${LOCK_KEY}::bigint)`; } catch {}
+  }
 }
 
 /* ===== Utils ===== */
@@ -159,7 +193,7 @@ export async function listStaffUsers(req, res) {
 
     const ids = users.map((u) => u.id);
     const lockedRows = ids.length
-      ? await sql/*sql*/`SELECT user_id, locked, role FROM clerk_user_flags WHERE user_id = ANY(${ids})`
+      ? await sql/*sql*/`SELECT user_id, locked, role FROM public.clerk_user_flags WHERE user_id = ANY(${ids})`
       : [];
     const lockedMap = new Map(lockedRows.map((r) => [r.user_id, r.locked]));
 
@@ -215,7 +249,7 @@ export async function makeStaff(req, res) {
     });
 
     await sql/*sql*/`
-      INSERT INTO clerk_user_flags (user_id, role, locked)
+      INSERT INTO public.clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'staff', FALSE)
       ON CONFLICT (user_id) DO UPDATE SET role = 'staff', updated_at = now()
     `;
@@ -246,7 +280,7 @@ export async function revokeStaff(req, res) {
     });
 
     await sql/*sql*/`
-      INSERT INTO clerk_user_flags (user_id, role, locked)
+      INSERT INTO public.clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', FALSE)
       ON CONFLICT (user_id) DO UPDATE SET role = 'user', updated_at = now()
     `;
@@ -272,7 +306,7 @@ export async function lockUser(req, res) {
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
     await sql/*sql*/`
-      INSERT INTO clerk_user_flags (user_id, role, locked)
+      INSERT INTO public.clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', TRUE)
       ON CONFLICT (user_id) DO UPDATE SET locked = TRUE, updated_at = now()
     `;
@@ -297,7 +331,7 @@ export async function unlockUser(req, res) {
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
     await sql/*sql*/`
-      INSERT INTO clerk_user_flags (user_id, role, locked)
+      INSERT INTO public.clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', FALSE)
       ON CONFLICT (user_id) DO UPDATE SET locked = FALSE, updated_at = now()
     `;
