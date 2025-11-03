@@ -4,22 +4,31 @@ import { sql } from "../config/db.js";
 /* ===== Clerk REST (sem SDK) ===== */
 const CLERK_BASE = "https://api.clerk.com/v1";
 const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY; // sk_*
+const isProd = process.env.NODE_ENV === "production";
 
 if (!CLERK_SECRET_KEY) {
   console.warn("[staffUsersController] Missing CLERK_SECRET_KEY env var");
 }
 
 /* ===== Tabela sombra (locked + role para fallback visual) ===== */
-async function ensureFlagsTable() {
+// Neon serverless NÃO permite múltiplas statements no mesmo sql``.
+// Separa e corre só uma vez.
+let _flagsInitDone = false;
+async function ensureFlagsTableOnce() {
+  if (_flagsInitDone) return;
   await sql/*sql*/`
     CREATE TABLE IF NOT EXISTS clerk_user_flags (
       user_id TEXT PRIMARY KEY,
-      role TEXT NOT NULL DEFAULT 'user',      -- espelho (não é fonte de verdade)
+      role TEXT NOT NULL DEFAULT 'user',
       locked BOOLEAN NOT NULL DEFAULT FALSE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-    CREATE INDEX IF NOT EXISTS clerk_user_flags_locked_idx ON clerk_user_flags (locked);
+    )
   `;
+  await sql/*sql*/`
+    CREATE INDEX IF NOT EXISTS clerk_user_flags_locked_idx
+    ON clerk_user_flags (locked)
+  `;
+  _flagsInitDone = true;
 }
 
 /* ===== Utils ===== */
@@ -38,11 +47,7 @@ function parsePaging(req) {
 }
 function norm(s) { return String(s ?? "").trim(); }
 function looksLikeEmail(s) { return /\S+@\S+\.\S+/.test(s); }
-const isProd = process.env.NODE_ENV === "production";
-
-function genReqId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
-}
+function genReqId() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
 async function clerkFetch(path, init = {}) {
   if (!CLERK_SECRET_KEY) {
@@ -67,7 +72,6 @@ async function clerkFetch(path, init = {}) {
     err.status = 429;
     throw err;
   }
-
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     const err = new Error(`Clerk ${res.status}: ${body || "<empty>"}`);
@@ -75,7 +79,6 @@ async function clerkFetch(path, init = {}) {
     err.body = body;
     throw err;
   }
-
   return res.json();
 }
 
@@ -101,8 +104,8 @@ function toSafeUser(u, lockedMap) {
     id: u.id,
     email,
     name,
-    role,                                   // 'staff' | 'user'
-    status: locked ? "locked" : baseStatus, // 'locked' tem prioridade na UI
+    role,
+    status: locked ? "locked" : baseStatus,
     created_at,
     last_active_at,
     locked,
@@ -115,7 +118,7 @@ export async function listStaffUsers(req, res) {
   res.setHeader("x-request-id", reqId);
 
   try {
-    await ensureFlagsTable();
+    await ensureFlagsTableOnce();
 
     const { pageSize, offset } = parsePaging(req);
     const qRaw = norm(req.query.q || req.query.query || "");
@@ -123,36 +126,28 @@ export async function listStaffUsers(req, res) {
     const orderParam = String(req.query.order || "-created_at");
     const order_by = orderParam.startsWith("-") ? "-created_at" : "created_at";
 
-    // Construção segura dos parâmetros para Clerk
     const params = new URLSearchParams();
     params.set("limit", String(pageSize));
     params.set("offset", String(offset));
     params.set("order_by", order_by);
-
-    // A Clerk é chatinha com filtros. Só envia email_address se parecer email.
     if (qRaw && looksLikeEmail(qRaw)) {
       params.append("email_address", qRaw);
     }
-    // NÃO enviar "query" aqui para evitar 400 em tenants sem full-text.
-    // Vamos fazer filtro server-side após receber a página.
 
     let data;
     try {
       data = await clerkFetch(`/users?${params.toString()}`);
     } catch (e) {
-      // Rate limit surfado de forma limpa
       if (e && e.message === "RATE_LIMIT") {
         res.setHeader("Retry-After", String(e.retryAfter));
         return res.status(429).json({ error: "rate_limited", retry_after: e.retryAfter, reqId });
       }
-      // Auth/config/4xx da Clerk: não deites 500 mudo
       if (e && (e.status === 401 || e.status === 403)) {
         const payload = isProd
           ? { error: "clerk_auth_failed", reqId }
           : { error: "clerk_auth_failed", reqId, detail: e.message };
         return res.status(502).json(payload);
       }
-      // Outros erros da Clerk
       const payload = isProd
         ? { error: "clerk_error", reqId }
         : { error: "clerk_error", reqId, detail: e.message };
@@ -168,10 +163,8 @@ export async function listStaffUsers(req, res) {
       : [];
     const lockedMap = new Map(lockedRows.map((r) => [r.user_id, r.locked]));
 
-    // Mapeia
     let items = users.map((u) => toSafeUser(u, lockedMap));
 
-    // Filtro server-side (name/email/id) se q não foi usado como email exato
     if (qRaw && !looksLikeEmail(qRaw)) {
       const ql = q;
       items = items.filter(
@@ -182,7 +175,6 @@ export async function listStaffUsers(req, res) {
       );
     }
 
-    // Ordenação server-side para consistência (created_at desc quando "-created_at")
     if (order_by === "-created_at") {
       items.sort((a, b) => {
         const ta = a.created_at ? +new Date(a.created_at) : 0;
@@ -199,9 +191,7 @@ export async function listStaffUsers(req, res) {
 
     return res.json({ items, total, pageSize, offset, reqId });
   } catch (err) {
-    // NÃO escondas o erro no server logs
     console.error(`[staff.listStaffUsers] reqId=${reqId}`, err);
-    // Em dev devolve detalhe, em prod devolve genérico
     const payload = isProd
       ? { error: "failed_list_users", reqId }
       : { error: "failed_list_users", reqId, detail: String(err?.message || err) };
@@ -215,7 +205,7 @@ export async function makeStaff(req, res) {
   res.setHeader("x-request-id", reqId);
 
   try {
-    await ensureFlagsTable();
+    await ensureFlagsTableOnce();
     const userId = String(req.params.id || "");
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
@@ -246,7 +236,7 @@ export async function revokeStaff(req, res) {
   res.setHeader("x-request-id", reqId);
 
   try {
-    await ensureFlagsTable();
+    await ensureFlagsTableOnce();
     const userId = String(req.params.id || "");
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
@@ -277,7 +267,7 @@ export async function lockUser(req, res) {
   res.setHeader("x-request-id", reqId);
 
   try {
-    await ensureFlagsTable();
+    await ensureFlagsTableOnce();
     const userId = String(req.params.id || "");
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
@@ -302,7 +292,7 @@ export async function unlockUser(req, res) {
   res.setHeader("x-request-id", reqId);
 
   try {
-    await ensureFlagsTable();
+    await ensureFlagsTableOnce();
     const userId = String(req.params.id || "");
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
