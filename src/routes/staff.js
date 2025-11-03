@@ -16,16 +16,11 @@ import {
   listStaffUsers,
   lockUser,
   unlockUser,
-  makeAdmin,
-  revokeAdmin,
+  makeStaff,
+  revokeStaff,
 } from "../controllers/staffUsersController.js";
 
-import adminOnly from "../middleware/adminOnly.js";
-
 const router = Router();
-
-// 🔐 tudo em /staff protegido para admins
-router.use(adminOnly);
 
 // Health
 router.get("/ping", ping);
@@ -55,7 +50,7 @@ router.get("/miner-state-events", listarMinerStateEvents);
 router.get("/users", listStaffUsers);
 router.post("/users/:id/lock", lockUser);
 router.post("/users/:id/unlock", unlockUser);
-router.post("/users/:id/make-admin", makeAdmin);
-router.post("/users/:id/revoke-admin", revokeAdmin);
+router.post("/users/:id/make-staff", makeStaff);
+router.post("/users/:id/revoke-staff", revokeStaff);
 
 export default router;

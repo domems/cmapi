@@ -1,101 +1,194 @@
-// controllers/staffUsersController.js
+// src/controllers/staffUsersController.js
 import { sql } from "../config/db.js";
-import { clerkClient } from "@clerk/clerk-sdk-node";
 
-/** Garante a tabela sombra para flags locais */
+/* ===== Clerk REST (sem SDK) ===== */
+const CLERK_BASE = "https://api.clerk.com/v1";
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY; // sk_*
+
+if (!CLERK_SECRET_KEY) {
+  console.warn("[staffUsersController] Missing CLERK_SECRET_KEY env var");
+}
+
+/* ===== Tabela sombra (locked + role para fallback visual) ===== */
 async function ensureFlagsTable() {
   await sql/*sql*/`
     CREATE TABLE IF NOT EXISTS clerk_user_flags (
       user_id TEXT PRIMARY KEY,
-      role TEXT NOT NULL DEFAULT 'user',        -- 'admin' | 'user'
+      role TEXT NOT NULL DEFAULT 'user',      -- NÃO é fonte de verdade; apenas espelho
       locked BOOLEAN NOT NULL DEFAULT FALSE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+    CREATE INDEX IF NOT EXISTS clerk_user_flags_locked_idx ON clerk_user_flags (locked);
   `;
 }
 
-/* ---------- Utils ---------- */
+/* ===== Utils ===== */
 function clamp(n, min, max) {
   const v = Number.parseInt(String(n ?? ""), 10);
   if (!Number.isFinite(v)) return min;
   return Math.max(min, Math.min(max, v));
 }
-
 function parsePaging(req) {
-  const page = clamp(req.query.page ?? 1, 1, 10_000);
   const pageSize = clamp(req.query.pageSize ?? req.query.limit ?? 20, 1, 100);
-  const offset = req.query.offset != null ? clamp(req.query.offset, 0, 1e9) : (page - 1) * pageSize;
-  return { page, pageSize, offset, limit: pageSize };
+  const offset =
+    req.query.offset != null
+      ? clamp(req.query.offset, 0, 1e9)
+      : (clamp(req.query.page ?? 1, 1, 10_000) - 1) * pageSize;
+  return { pageSize, offset };
+}
+function norm(s) { return String(s ?? "").trim().toLowerCase(); }
+
+async function clerkFetch(path, init = {}) {
+  if (!CLERK_SECRET_KEY) throw new Error("CLERK_SECRET_KEY not set");
+  const res = await fetch(`${CLERK_BASE}${path}`, {
+    ...init,
+    headers: {
+      Accept: "application/json",
+      Authorization: `Bearer ${CLERK_SECRET_KEY}`,
+      "Content-Type": "application/json",
+      ...(init.headers || {}),
+    },
+  });
+  if (res.status === 429) {
+    const retry = Math.min(Math.max(Number(res.headers.get("Retry-After")) || 60, 5), 300);
+    const err = new Error("RATE_LIMIT");
+    err.retryAfter = retry;
+    throw err;
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    const err = new Error(`Clerk ${res.status}: ${body}`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
 }
 
-function norm(s) {
-  return String(s ?? "").trim().toLowerCase();
-}
+/* ===== Mapping ===== */
+function toSafeUser(u, lockedMap) {
+  const email =
+    (u.email_addresses && u.email_addresses[0]?.email_address) ||
+    u.primary_email_address_id ||
+    "";
+  const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || null;
+  const created_at = u.created_at ? new Date(u.created_at * 1000).toISOString() : null;
+  const last_active_at = u.last_active_at ? new Date(u.last_active_at * 1000).toISOString() : null;
 
-function toSafeUser(u, flagsMap) {
-  const primaryEmail = (u.emailAddresses || [])[0]?.emailAddress ?? "";
-  const name = [u.firstName, u.lastName].filter(Boolean).join(" ") || null;
-  const created_at = u.createdAt ? new Date(u.createdAt).toISOString() : null;
-  const last_active_at = u.lastActiveAt ? new Date(u.lastActiveAt).toISOString() : null;
+  const invited = !u.last_active_at;
+  const baseStatus = invited ? "invited" : "active";
 
-  // status simplificado para UI (não dependemos de campos privados do Clerk)
-  // invited: nunca fez sign-in; active: default
-  const invited = !u.lastActiveAt;
-  const status = invited ? "invited" : "active";
+  const r = String(u.public_metadata?.role || "user").toLowerCase();
+  const role = r === "staff" ? "staff" : "user"; // <— sem admin
 
-  const flags = flagsMap.get(u.id) || { role: "user", locked: false };
+  const locked = !!lockedMap.get(u.id);
 
   return {
     id: u.id,
-    email: primaryEmail,
+    email,
     name,
-    role: flags.role === "admin" ? "admin" : "user",
-    status: flags.locked ? "locked" : status, // locked tem prioridade na UI
+    role,                                   // 'staff' | 'user'
+    status: locked ? "locked" : baseStatus, // 'locked' tem prioridade na UI
     created_at,
     last_active_at,
-    locked: !!flags.locked,
+    locked,
   };
 }
 
-/* ---------- GET /staff/users ---------- */
+/* ===== GET /staff/users ===== */
 export async function listStaffUsers(req, res) {
   try {
     await ensureFlagsTable();
 
     const { pageSize, offset } = parsePaging(req);
     const q = norm(req.query.q || req.query.query || "");
-    const order = String(req.query.order || "-created_at"); // só para compat UI
+    const order = String(req.query.order || "-created_at"); // compat UI
 
-    // Clerk pagina por "limit & offset"
-    const clerkPage = await clerkClient.users.getUserList({
-      limit: pageSize,
-      offset,
-      // não há full-text global simples; tentamos pelos filtros disponíveis:
-      emailAddress: q ? [q] : undefined,
-      orderBy: order.startsWith("-") ? "-created_at" : "created_at",
-    });
+    const params = new URLSearchParams();
+    params.set("limit", String(pageSize));
+    params.set("offset", String(offset));
+    params.set("order_by", order.startsWith("-") ? "-created_at" : "created_at");
+    if (q) params.append("email_address", q); // Clerk não expõe full-text universal
 
-    const ids = clerkPage.data.map((u) => u.id);
-    const flagsRows = ids.length
-      ? await sql/*sql*/`SELECT user_id, role, locked FROM clerk_user_flags WHERE user_id = ANY(${ids})`
+    let data;
+    try {
+      data = await clerkFetch(`/users?${params.toString()}`);
+    } catch (e) {
+      if (e.message === "RATE_LIMIT") {
+        res.setHeader("Retry-After", String(e.retryAfter));
+        return res.status(429).json({ error: "rate_limited", retry_after: e.retryAfter });
+      }
+      throw e;
+    }
+
+    const users = Array.isArray(data?.data) ? data.data : data;
+    const total = Number(data?.total_count ?? users?.length ?? 0);
+
+    const ids = (users || []).map((u) => u.id);
+    const lockedRows = ids.length
+      ? await sql/*sql*/`SELECT user_id, locked FROM clerk_user_flags WHERE user_id = ANY(${ids})`
       : [];
-    const flagsMap = new Map(flagsRows.map((r) => [r.user_id, { role: r.role, locked: r.locked }]));
+    const lockedMap = new Map(lockedRows.map((r) => [r.user_id, r.locked]));
 
-    const items = clerkPage.data.map((u) => toSafeUser(u, flagsMap));
-
-    res.json({
-      items,
-      total: clerkPage.totalCount ?? items.length,
-      pageSize,
-      offset,
-    });
+    const items = (users || []).map((u) => toSafeUser(u, lockedMap));
+    res.json({ items, total, pageSize, offset });
   } catch (err) {
     console.error("staff.listStaffUsers:", err);
     res.status(500).json({ error: "failed_list_users" });
   }
 }
 
-/* ---------- POST /staff/users/:id/lock ---------- */
+/* ===== POST /staff/users/:id/make-staff ===== */
+export async function makeStaff(req, res) {
+  try {
+    await ensureFlagsTable();
+    const userId = String(req.params.id || "");
+    if (!userId) return res.status(400).json({ error: "missing_user_id" });
+
+    await clerkFetch(`/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ public_metadata: { role: "staff" } }),
+    });
+
+    // sombra (não é fonte, mas mantém coerência visual)
+    await sql/*sql*/`
+      INSERT INTO clerk_user_flags (user_id, role, locked)
+      VALUES (${userId}, 'staff', FALSE)
+      ON CONFLICT (user_id) DO UPDATE SET role = 'staff', updated_at = now()
+    `;
+
+    res.json({ ok: true, user_id: userId, role: "staff" });
+  } catch (err) {
+    console.error("staff.makeStaff:", err);
+    res.status(500).json({ error: "failed_make_staff" });
+  }
+}
+
+/* ===== POST /staff/users/:id/revoke-staff ===== */
+export async function revokeStaff(req, res) {
+  try {
+    await ensureFlagsTable();
+    const userId = String(req.params.id || "");
+    if (!userId) return res.status(400).json({ error: "missing_user_id" });
+
+    await clerkFetch(`/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ public_metadata: { role: "user" } }),
+    });
+
+    await sql/*sql*/`
+      INSERT INTO clerk_user_flags (user_id, role, locked)
+      VALUES (${userId}, 'user', FALSE)
+      ON CONFLICT (user_id) DO UPDATE SET role = 'user', updated_at = now()
+    `;
+
+    res.json({ ok: true, user_id: userId, role: "user" });
+  } catch (err) {
+    console.error("staff.revokeStaff:", err);
+    res.status(500).json({ error: "failed_revoke_staff" });
+  }
+}
+
+/* ===== POST /staff/users/:id/lock ===== */
 export async function lockUser(req, res) {
   try {
     await ensureFlagsTable();
@@ -105,18 +198,16 @@ export async function lockUser(req, res) {
     await sql/*sql*/`
       INSERT INTO clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', TRUE)
-      ON CONFLICT (user_id)
-      DO UPDATE SET locked = EXCLUDED.locked, updated_at = now()
+      ON CONFLICT (user_id) DO UPDATE SET locked = TRUE, updated_at = now()
     `;
-
-    return res.json({ ok: true, user_id: userId, locked: true });
+    res.json({ ok: true, user_id: userId, locked: true });
   } catch (err) {
     console.error("staff.lockUser:", err);
     res.status(500).json({ error: "failed_lock" });
   }
 }
 
-/* ---------- POST /staff/users/:id/unlock ---------- */
+/* ===== POST /staff/users/:id/unlock ===== */
 export async function unlockUser(req, res) {
   try {
     await ensureFlagsTable();
@@ -126,55 +217,11 @@ export async function unlockUser(req, res) {
     await sql/*sql*/`
       INSERT INTO clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', FALSE)
-      ON CONFLICT (user_id)
-      DO UPDATE SET locked = EXCLUDED.locked, updated_at = now()
+      ON CONFLICT (user_id) DO UPDATE SET locked = FALSE, updated_at = now()
     `;
-
-    return res.json({ ok: true, user_id: userId, locked: false });
+    res.json({ ok: true, user_id: userId, locked: false });
   } catch (err) {
     console.error("staff.unlockUser:", err);
     res.status(500).json({ error: "failed_unlock" });
-  }
-}
-
-/* ---------- POST /staff/users/:id/make-admin ---------- */
-export async function makeAdmin(req, res) {
-  try {
-    await ensureFlagsTable();
-    const userId = String(req.params.id || "");
-    if (!userId) return res.status(400).json({ error: "missing_user_id" });
-
-    await sql/*sql*/`
-      INSERT INTO clerk_user_flags (user_id, role, locked)
-      VALUES (${userId}, 'admin', FALSE)
-      ON CONFLICT (user_id)
-      DO UPDATE SET role = 'admin', updated_at = now()
-    `;
-
-    return res.json({ ok: true, user_id: userId, role: "admin" });
-  } catch (err) {
-    console.error("staff.makeAdmin:", err);
-    res.status(500).json({ error: "failed_make_admin" });
-  }
-}
-
-/* ---------- POST /staff/users/:id/revoke-admin ---------- */
-export async function revokeAdmin(req, res) {
-  try {
-    await ensureFlagsTable();
-    const userId = String(req.params.id || "");
-    if (!userId) return res.status(400).json({ error: "missing_user_id" });
-
-    await sql/*sql*/`
-      INSERT INTO clerk_user_flags (user_id, role, locked)
-      VALUES (${userId}, 'user', FALSE)
-      ON CONFLICT (user_id)
-      DO UPDATE SET role = 'user', updated_at = now()
-    `;
-
-    return res.json({ ok: true, user_id: userId, role: "user" });
-  } catch (err) {
-    console.error("staff.revokeAdmin:", err);
-    res.status(500).json({ error: "failed_revoke_admin" });
   }
 }
