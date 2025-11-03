@@ -30,19 +30,16 @@ async function ensureFlagsTableOnce() {
     const rel = existsRes?.[0]?.rel;
 
     if (!rel) {
-      // remove TYPE órfão que impede CREATE TABLE
-      // (se não existir, não faz nada)
+      // remove TYPE órfão que impede CREATE TABLE (no-op se não existir)
       await sql/*sql*/`DO $$
       BEGIN
         IF EXISTS (SELECT 1 FROM pg_type t
                    JOIN pg_namespace n ON n.oid = t.typnamespace
                    WHERE t.typname = 'clerk_user_flags' AND n.nspname = 'public') THEN
-          -- tenta RESTRICT; se tiver dependências (improvável), não arrisca CASCADE
           EXECUTE 'DROP TYPE public.clerk_user_flags';
         END IF;
       END$$;`;
 
-      // cria tabela (uma statement)
       await sql/*sql*/`
         CREATE TABLE IF NOT EXISTS public.clerk_user_flags (
           user_id TEXT PRIMARY KEY,
@@ -52,7 +49,6 @@ async function ensureFlagsTableOnce() {
         )
       `;
 
-      // cria índice (nova statement)
       await sql/*sql*/`
         CREATE INDEX IF NOT EXISTS clerk_user_flags_locked_idx
         ON public.clerk_user_flags (locked)
@@ -116,21 +112,47 @@ async function clerkFetch(path, init = {}) {
   return res.json();
 }
 
-/* ===== Mapping ===== */
-function toSafeUser(u, lockedMap) {
-  const email =
-    (u.email_addresses && u.email_addresses[0]?.email_address) ||
-    u.primary_email_address_id ||
-    "";
-  const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || null;
-  const created_at = u.created_at ? new Date(u.created_at * 1000).toISOString() : null;
-  const last_active_at = u.last_active_at ? new Date(u.last_active_at * 1000).toISOString() : null;
+/* ===== Mapping helpers ===== */
+function epochToIso(sec) {
+  if (!sec && sec !== 0) return null;
+  const ms = Number(sec) * 1000;
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return new Date(ms).toISOString();
+}
 
-  const invited = !u.last_active_at;
+function primaryEmailFromClerkUser(u) {
+  const list = Array.isArray(u?.email_addresses) ? u.email_addresses : [];
+  if (!list.length) return "";
+  const primaryId = u?.primary_email_address_id || null;
+  if (primaryId) {
+    const hit = list.find(e => e?.id === primaryId);
+    if (hit?.email_address) return hit.email_address;
+  }
+  // fallback: first email
+  return list[0]?.email_address || "";
+}
+
+/** Converte o user do Clerk para o payload da app, preservando admin/staff/user e datas em ISO. */
+function toSafeUser(u, lockedMap) {
+  const email = primaryEmailFromClerkUser(u);
+  const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || null;
+
+  // Clerk devolve timestamps em segundos (Unix epoch)
+  const created_at = epochToIso(u?.created_at);
+  const last_active_at = epochToIso(u?.last_active_at);
+
+  const invited = !u?.last_active_at;
   const baseStatus = invited ? "invited" : "active";
 
-  const r = String(u.public_metadata?.role || "user").toLowerCase();
-  const role = r === "staff" ? "staff" : "user";
+  const meta_role_raw = String(u?.public_metadata?.role ?? "").toLowerCase();
+  const meta_role =
+    meta_role_raw === "admin" ? "admin" :
+    meta_role_raw === "staff" ? "staff" :
+    "user";
+
+  // role base (compat com UI existente)
+  const role = meta_role === "staff" ? "staff" : "user";
+  const is_admin = meta_role === "admin";
 
   const locked = !!lockedMap.get(u.id);
 
@@ -138,10 +160,12 @@ function toSafeUser(u, lockedMap) {
     id: u.id,
     email,
     name,
-    role,
+    role,                 // "user" | "staff" (compat/UI)
+    meta_role,            // "user" | "staff" | "admin"
+    is_admin,             // boolean
     status: locked ? "locked" : baseStatus,
-    created_at,
-    last_active_at,
+    created_at,           // ISO string ou null
+    last_active_at,       // ISO string ou null
     locked,
   };
 }
@@ -163,10 +187,12 @@ export async function listStaffUsers(req, res) {
     const params = new URLSearchParams();
     params.set("limit", String(pageSize));
     params.set("offset", String(offset));
-    params.set("order_by", order_by);
+    // Clerk agora aceita order: created_at/updated_at (asc/desc). Mantemos simples.
+    // (Se quiseres, podes usar &order_by=created_at&order_direction=desc no Clerk)
     if (qRaw && looksLikeEmail(qRaw)) {
       params.append("email_address", qRaw);
     }
+    // NOTA: se quiseres procurar por nome/ID no Clerk, terás de paginar e filtrar client-side (o que já fazes)
 
     let data;
     try {
@@ -199,6 +225,7 @@ export async function listStaffUsers(req, res) {
 
     let items = users.map((u) => toSafeUser(u, lockedMap));
 
+    // pesquisa local por nome/email/id quando não é email exato
     if (qRaw && !looksLikeEmail(qRaw)) {
       const ql = q;
       items = items.filter(
@@ -209,6 +236,7 @@ export async function listStaffUsers(req, res) {
       );
     }
 
+    // order local por created_at
     if (order_by === "-created_at") {
       items.sort((a, b) => {
         const ta = a.created_at ? +new Date(a.created_at) : 0;
