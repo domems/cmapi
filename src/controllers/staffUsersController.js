@@ -14,7 +14,7 @@ async function ensureFlagsTable() {
   await sql/*sql*/`
     CREATE TABLE IF NOT EXISTS clerk_user_flags (
       user_id TEXT PRIMARY KEY,
-      role TEXT NOT NULL DEFAULT 'user',      -- NÃO é fonte de verdade; apenas espelho
+      role TEXT NOT NULL DEFAULT 'user',      -- espelho (não é fonte de verdade)
       locked BOOLEAN NOT NULL DEFAULT FALSE,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
@@ -36,10 +36,20 @@ function parsePaging(req) {
       : (clamp(req.query.page ?? 1, 1, 10_000) - 1) * pageSize;
   return { pageSize, offset };
 }
-function norm(s) { return String(s ?? "").trim().toLowerCase(); }
+function norm(s) { return String(s ?? "").trim(); }
+function looksLikeEmail(s) { return /\S+@\S+\.\S+/.test(s); }
+const isProd = process.env.NODE_ENV === "production";
+
+function genReqId() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
 
 async function clerkFetch(path, init = {}) {
-  if (!CLERK_SECRET_KEY) throw new Error("CLERK_SECRET_KEY not set");
+  if (!CLERK_SECRET_KEY) {
+    const e = new Error("CLERK_SECRET_KEY not set");
+    e.code = "CONFIG";
+    throw e;
+  }
   const res = await fetch(`${CLERK_BASE}${path}`, {
     ...init,
     headers: {
@@ -49,18 +59,23 @@ async function clerkFetch(path, init = {}) {
       ...(init.headers || {}),
     },
   });
+
   if (res.status === 429) {
     const retry = Math.min(Math.max(Number(res.headers.get("Retry-After")) || 60, 5), 300);
     const err = new Error("RATE_LIMIT");
     err.retryAfter = retry;
+    err.status = 429;
     throw err;
   }
+
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    const err = new Error(`Clerk ${res.status}: ${body}`);
+    const err = new Error(`Clerk ${res.status}: ${body || "<empty>"}`);
     err.status = res.status;
+    err.body = body;
     throw err;
   }
+
   return res.json();
 }
 
@@ -78,7 +93,7 @@ function toSafeUser(u, lockedMap) {
   const baseStatus = invited ? "invited" : "active";
 
   const r = String(u.public_metadata?.role || "user").toLowerCase();
-  const role = r === "staff" ? "staff" : "user"; // <— sem admin
+  const role = r === "staff" ? "staff" : "user";
 
   const locked = !!lockedMap.get(u.id);
 
@@ -96,79 +111,144 @@ function toSafeUser(u, lockedMap) {
 
 /* ===== GET /staff/users ===== */
 export async function listStaffUsers(req, res) {
+  const reqId = genReqId();
+  res.setHeader("x-request-id", reqId);
+
   try {
     await ensureFlagsTable();
 
     const { pageSize, offset } = parsePaging(req);
-    const q = norm(req.query.q || req.query.query || "");
-    const order = String(req.query.order || "-created_at"); // compat UI
+    const qRaw = norm(req.query.q || req.query.query || "");
+    const q = qRaw.toLowerCase();
+    const orderParam = String(req.query.order || "-created_at");
+    const order_by = orderParam.startsWith("-") ? "-created_at" : "created_at";
 
+    // Construção segura dos parâmetros para Clerk
     const params = new URLSearchParams();
     params.set("limit", String(pageSize));
     params.set("offset", String(offset));
-    params.set("order_by", order.startsWith("-") ? "-created_at" : "created_at");
-    if (q) params.append("email_address", q); // Clerk não expõe full-text universal
+    params.set("order_by", order_by);
+
+    // A Clerk é chatinha com filtros. Só envia email_address se parecer email.
+    if (qRaw && looksLikeEmail(qRaw)) {
+      params.append("email_address", qRaw);
+    }
+    // NÃO enviar "query" aqui para evitar 400 em tenants sem full-text.
+    // Vamos fazer filtro server-side após receber a página.
 
     let data;
     try {
       data = await clerkFetch(`/users?${params.toString()}`);
     } catch (e) {
-      if (e.message === "RATE_LIMIT") {
+      // Rate limit surfado de forma limpa
+      if (e && e.message === "RATE_LIMIT") {
         res.setHeader("Retry-After", String(e.retryAfter));
-        return res.status(429).json({ error: "rate_limited", retry_after: e.retryAfter });
+        return res.status(429).json({ error: "rate_limited", retry_after: e.retryAfter, reqId });
       }
-      throw e;
+      // Auth/config/4xx da Clerk: não deites 500 mudo
+      if (e && (e.status === 401 || e.status === 403)) {
+        const payload = isProd
+          ? { error: "clerk_auth_failed", reqId }
+          : { error: "clerk_auth_failed", reqId, detail: e.message };
+        return res.status(502).json(payload);
+      }
+      // Outros erros da Clerk
+      const payload = isProd
+        ? { error: "clerk_error", reqId }
+        : { error: "clerk_error", reqId, detail: e.message };
+      return res.status(502).json(payload);
     }
 
-    const users = Array.isArray(data?.data) ? data.data : data;
-    const total = Number(data?.total_count ?? users?.length ?? 0);
+    const users = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
+    const total = Number(data?.total_count ?? (Array.isArray(users) ? users.length : 0));
 
-    const ids = (users || []).map((u) => u.id);
+    const ids = users.map((u) => u.id);
     const lockedRows = ids.length
-      ? await sql/*sql*/`SELECT user_id, locked FROM clerk_user_flags WHERE user_id = ANY(${ids})`
+      ? await sql/*sql*/`SELECT user_id, locked, role FROM clerk_user_flags WHERE user_id = ANY(${ids})`
       : [];
     const lockedMap = new Map(lockedRows.map((r) => [r.user_id, r.locked]));
 
-    const items = (users || []).map((u) => toSafeUser(u, lockedMap));
-    res.json({ items, total, pageSize, offset });
+    // Mapeia
+    let items = users.map((u) => toSafeUser(u, lockedMap));
+
+    // Filtro server-side (name/email/id) se q não foi usado como email exato
+    if (qRaw && !looksLikeEmail(qRaw)) {
+      const ql = q;
+      items = items.filter(
+        (it) =>
+          (it.name || "").toLowerCase().includes(ql) ||
+          (it.email || "").toLowerCase().includes(ql) ||
+          (it.id || "").toLowerCase().includes(ql)
+      );
+    }
+
+    // Ordenação server-side para consistência (created_at desc quando "-created_at")
+    if (order_by === "-created_at") {
+      items.sort((a, b) => {
+        const ta = a.created_at ? +new Date(a.created_at) : 0;
+        const tb = b.created_at ? +new Date(b.created_at) : 0;
+        return tb - ta;
+      });
+    } else {
+      items.sort((a, b) => {
+        const ta = a.created_at ? +new Date(a.created_at) : 0;
+        const tb = b.created_at ? +new Date(b.created_at) : 0;
+        return ta - tb;
+      });
+    }
+
+    return res.json({ items, total, pageSize, offset, reqId });
   } catch (err) {
-    console.error("staff.listStaffUsers:", err);
-    res.status(500).json({ error: "failed_list_users" });
+    // NÃO escondas o erro no server logs
+    console.error(`[staff.listStaffUsers] reqId=${reqId}`, err);
+    // Em dev devolve detalhe, em prod devolve genérico
+    const payload = isProd
+      ? { error: "failed_list_users", reqId }
+      : { error: "failed_list_users", reqId, detail: String(err?.message || err) };
+    return res.status(500).json(payload);
   }
 }
 
 /* ===== POST /staff/users/:id/make-staff ===== */
 export async function makeStaff(req, res) {
+  const reqId = genReqId();
+  res.setHeader("x-request-id", reqId);
+
   try {
     await ensureFlagsTable();
     const userId = String(req.params.id || "");
-    if (!userId) return res.status(400).json({ error: "missing_user_id" });
+    if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
     await clerkFetch(`/users/${encodeURIComponent(userId)}`, {
       method: "PATCH",
       body: JSON.stringify({ public_metadata: { role: "staff" } }),
     });
 
-    // sombra (não é fonte, mas mantém coerência visual)
     await sql/*sql*/`
       INSERT INTO clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'staff', FALSE)
       ON CONFLICT (user_id) DO UPDATE SET role = 'staff', updated_at = now()
     `;
 
-    res.json({ ok: true, user_id: userId, role: "staff" });
+    return res.json({ ok: true, user_id: userId, role: "staff", reqId });
   } catch (err) {
-    console.error("staff.makeStaff:", err);
-    res.status(500).json({ error: "failed_make_staff" });
+    console.error(`[staff.makeStaff] reqId=${reqId}`, err);
+    const payload = isProd
+      ? { error: "failed_make_staff", reqId }
+      : { error: "failed_make_staff", reqId, detail: String(err?.message || err) };
+    return res.status(500).json(payload);
   }
 }
 
 /* ===== POST /staff/users/:id/revoke-staff ===== */
 export async function revokeStaff(req, res) {
+  const reqId = genReqId();
+  res.setHeader("x-request-id", reqId);
+
   try {
     await ensureFlagsTable();
     const userId = String(req.params.id || "");
-    if (!userId) return res.status(400).json({ error: "missing_user_id" });
+    if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
     await clerkFetch(`/users/${encodeURIComponent(userId)}`, {
       method: "PATCH",
@@ -181,47 +261,62 @@ export async function revokeStaff(req, res) {
       ON CONFLICT (user_id) DO UPDATE SET role = 'user', updated_at = now()
     `;
 
-    res.json({ ok: true, user_id: userId, role: "user" });
+    return res.json({ ok: true, user_id: userId, role: "user", reqId });
   } catch (err) {
-    console.error("staff.revokeStaff:", err);
-    res.status(500).json({ error: "failed_revoke_staff" });
+    console.error(`[staff.revokeStaff] reqId=${reqId}`, err);
+    const payload = isProd
+      ? { error: "failed_revoke_staff", reqId }
+      : { error: "failed_revoke_staff", reqId, detail: String(err?.message || err) };
+    return res.status(500).json(payload);
   }
 }
 
 /* ===== POST /staff/users/:id/lock ===== */
 export async function lockUser(req, res) {
+  const reqId = genReqId();
+  res.setHeader("x-request-id", reqId);
+
   try {
     await ensureFlagsTable();
     const userId = String(req.params.id || "");
-    if (!userId) return res.status(400).json({ error: "missing_user_id" });
+    if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
     await sql/*sql*/`
       INSERT INTO clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', TRUE)
       ON CONFLICT (user_id) DO UPDATE SET locked = TRUE, updated_at = now()
     `;
-    res.json({ ok: true, user_id: userId, locked: true });
+    return res.json({ ok: true, user_id: userId, locked: true, reqId });
   } catch (err) {
-    console.error("staff.lockUser:", err);
-    res.status(500).json({ error: "failed_lock" });
+    console.error(`[staff.lockUser] reqId=${reqId}`, err);
+    const payload = isProd
+      ? { error: "failed_lock", reqId }
+      : { error: "failed_lock", reqId, detail: String(err?.message || err) };
+    return res.status(500).json(payload);
   }
 }
 
 /* ===== POST /staff/users/:id/unlock ===== */
 export async function unlockUser(req, res) {
+  const reqId = genReqId();
+  res.setHeader("x-request-id", reqId);
+
   try {
     await ensureFlagsTable();
     const userId = String(req.params.id || "");
-    if (!userId) return res.status(400).json({ error: "missing_user_id" });
+    if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
     await sql/*sql*/`
       INSERT INTO clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', FALSE)
       ON CONFLICT (user_id) DO UPDATE SET locked = FALSE, updated_at = now()
     `;
-    res.json({ ok: true, user_id: userId, locked: false });
+    return res.json({ ok: true, user_id: userId, locked: false, reqId });
   } catch (err) {
-    console.error("staff.unlockUser:", err);
-    res.status(500).json({ error: "failed_unlock" });
+    console.error(`[staff.unlockUser] reqId=${reqId}`, err);
+    const payload = isProd
+      ? { error: "failed_unlock", reqId }
+      : { error: "failed_unlock", reqId, detail: String(err?.message || err) };
+    return res.status(500).json(payload);
   }
 }
