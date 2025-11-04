@@ -3,31 +3,13 @@ import express from "express";
 import { sql } from "../config/db.js";
 import { setCachedList, invalidateUserList } from "../services/minersListCache.js";
 
-/* ===================== Utils & guards ===================== */
+/* ===================== Utils ===================== */
 const TAG = "[STAFF-MINERS+INVOICES]";
 
 function log(...a)   { try { console.log(TAG, ...a); } catch {} }
 function warn(...a)  { try { console.warn(TAG, ...a); } catch {} }
 function error(...a) { try { console.error(TAG, ...a); } catch {} }
 
-function isStaffOrAdmin(req) {
-  const metaRole =
-    req.auth?.sessionClaims?.metadata?.role ||
-    req.auth?.claims?.metadata?.role ||
-    req.user?.publicMetadata?.role ||
-    req.headers["x-user-role"] ||
-    req.headers["x-role"] ||
-    "";
-  const role = String(metaRole || "").toLowerCase();
-  return role === "staff" || role === "admin";
-}
-function requireStaffOrAdmin(req, res) {
-  if (!isStaffOrAdmin(req)) {
-    res.status(403).json({ error: "Forbidden (staff/admin only)" });
-    return false;
-  }
-  return true;
-}
 function parseIntIdOr400Param(req, res, key = "id") {
   const raw = req.params?.[key];
   const num = Number(raw);
@@ -65,6 +47,31 @@ function normalizeDecimal(input) {
   return n;
 }
 
+const ALLOWED_STATUS = new Set(["online", "offline", "maintenance"]);
+const ALLOWED_POOLS = new Set(["ViaBTC", "LiteCoinPool"]);
+
+function ensureStatus(val) {
+  if (val === undefined || val === null || val === "") return null;
+  const v = String(val).toLowerCase();
+  if (!ALLOWED_STATUS.has(v)) {
+    throw new Error("Status inválido (use 'online'|'offline'|'maintenance').");
+  }
+  return v;
+}
+function ensurePool(val) {
+  if (val === undefined || val === null || val === "") return null;
+  const v = String(val);
+  if (!ALLOWED_POOLS.has(v)) {
+    throw new Error("Pool inválida (use 'ViaBTC' ou 'LiteCoinPool').");
+  }
+  return v;
+}
+function redactSecrets(row, allowSecrets) {
+  if (allowSecrets) return row;
+  const { api_key, secret_key, ...rest } = row || {};
+  return { ...rest, api_key: null, secret_key: null };
+}
+
 /* ===================== Router ===================== */
 const router = express.Router();
 
@@ -73,11 +80,13 @@ const router = express.Router();
 /**
  * GET /api/staff/users/:userId/miners
  * Lista miners do utilizador alvo (ETag + 304).
+ * ?reveal=1 para incluir api_key/secret_key.
  */
 router.get("/users/:userId/miners", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
+
+  const reveal = String(req.query.reveal || "") === "1";
 
   try {
     const miners = await sql/*sql*/`
@@ -91,16 +100,16 @@ router.get("/users/:userId/miners", async (req, res) => {
       WHERE user_id = ${userId}
       ORDER BY created_at DESC, id DESC
     `;
-    const { etag } = setCachedList(userId, miners);
+    const safe = miners.map(r => redactSecrets(r, reveal));
+
+    const { etag } = setCachedList(`u:${userId}:reveal:${reveal ? 1 : 0}`, safe);
     const inm = req.headers["if-none-match"];
-    if (inm && inm === etag) {
-      res.status(304).end();
-      return;
-    }
+    if (inm && inm === etag) return res.status(304).end();
+
     res.setHeader("ETag", etag);
     res.setHeader("Cache-Control", "private, max-age=10, stale-while-revalidate=60");
-    res.setHeader("Vary", "Authorization, X-User-Role, X-Role");
-    res.json(miners);
+    res.setHeader("Vary", "Authorization, Accept-Encoding");
+    res.json(safe);
   } catch (e) {
     error("GET /users/:userId/miners", e?.message || e);
     res.status(500).json({ error: "Erro ao listar miners" });
@@ -109,11 +118,9 @@ router.get("/users/:userId/miners", async (req, res) => {
 
 /**
  * POST /api/staff/users/:userId/miners
- * Cria **um** miner para o utilizador alvo.
- * Body: { nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status, worker_name, api_key, secret_key, coin, pool, locked }
+ * Cria **um** miner.
  */
 router.post("/users/:userId/miners", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const user_id = String(req.params.userId || "");
   if (!user_id) return res.status(400).json({ error: "userId em falta" });
 
@@ -139,14 +146,15 @@ router.post("/users/:userId/miners", async (req, res) => {
     let hashRateNum = null, precoKwNum = null, consumoNum = null;
     try {
       hashRateNum = normalizeDecimal(hash_rate);
-      precoKwNum = normalizeDecimal(preco_kw);
+      precoKwNum  = normalizeDecimal(preco_kw);
       consumoNum  = normalizeDecimal(consumo_kw_hora);
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
 
     const lockedVal = typeof locked === "boolean" ? locked : true;
-    const statusVal = status ? String(status).toLowerCase() : "offline";
+    const statusVal = ensureStatus(status) ?? "offline";
+    const poolVal   = ensurePool(pool);
 
     const [row] = await sql/*sql*/`
       INSERT INTO miners (
@@ -164,7 +172,7 @@ router.post("/users/:userId/miners", async (req, res) => {
         ${api_key ? String(api_key).trim() : null},
         ${secret_key ? String(secret_key).trim() : null},
         ${coin ? String(coin).trim() : null},
-        ${pool ? String(pool).trim() : null},
+        ${poolVal},
         ${lockedVal}
       )
       RETURNING *
@@ -179,16 +187,9 @@ router.post("/users/:userId/miners", async (req, res) => {
 
 /**
  * POST /api/staff/users/:userId/miners/bulk
- * Cria **N** miners iguais (só muda o id). Opcionalmente podes usar padrões com {n}.
- * Body:
- * {
- *   count: number (1..200),
- *   values: { nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status, worker_name, api_key, secret_key, coin, pool, locked },
- *   patterns?: { nomePattern?: "L9 #{n}", workerNamePattern?: "client001.{n}" } // substitui {n}
- * }
+ * Cria **N** miners. Padrões com {n}.
  */
 router.post("/users/:userId/miners/bulk", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const user_id = String(req.params.userId || "");
   if (!user_id) return res.status(400).json({ error: "userId em falta" });
 
@@ -206,18 +207,17 @@ router.post("/users/:userId/miners/bulk", async (req, res) => {
     const hashRateNum    = normalizeDecimal(values?.hash_rate);
     const precoKwNum     = normalizeDecimal(values?.preco_kw);
     const consumoNum     = normalizeDecimal(values?.consumo_kw_hora);
-    const statusVal      = values?.status ? String(values.status).toLowerCase() : "offline";
+    const statusVal      = ensureStatus(values?.status) ?? "offline";
     const workerBase     = values?.worker_name ? String(values.worker_name).trim() : null;
     const apiKeyBase     = values?.api_key ? String(values.api_key).trim() : null;
     const secretKeyBase  = values?.secret_key ? String(values.secret_key).trim() : null;
     const coinBase       = values?.coin ? String(values.coin).trim() : null;
-    const poolBase       = values?.pool ? String(values.pool).trim() : null;
+    const poolVal        = ensurePool(values?.pool);
     const lockedVal      = typeof values?.locked === "boolean" ? values.locked : true;
 
-    const nomePattern = patterns?.nomePattern ? String(patterns.nomePattern) : null;
+    const nomePattern   = patterns?.nomePattern ? String(patterns.nomePattern) : null;
     const workerPattern = patterns?.workerNamePattern ? String(patterns.workerNamePattern) : null;
 
-    // Faz o INSERT em massa via generate_series para eficiência
     const inserted = await sql/*sql*/`
       INSERT INTO miners (
         user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
@@ -225,41 +225,27 @@ router.post("/users/:userId/miners/bulk", async (req, res) => {
       )
       SELECT
         ${user_id} AS user_id,
-        ${nomePattern ? null : nomeBase}::text
-          || ${nomePattern ? "" : ""} AS nome,
+        CASE
+          WHEN ${nomePattern}::text IS NOT NULL THEN REPLACE(${nomePattern}::text, '{n}', gs.n::text)
+          ELSE ${nomeBase}::text
+        END AS nome,
         ${modeloBase}::text AS modelo,
         ${hashRateNum}::numeric AS hash_rate,
         ${precoKwNum}::numeric AS preco_kw,
         ${consumoNum}::numeric AS consumo_kw_hora,
         ${statusVal}::text AS status,
-        ${workerPattern ? null : workerBase}::text AS worker_name,
+        CASE
+          WHEN ${workerPattern}::text IS NOT NULL THEN REPLACE(${workerPattern}::text, '{n}', gs.n::text)
+          ELSE ${workerBase}::text
+        END AS worker_name,
         ${apiKeyBase}::text AS api_key,
         ${secretKeyBase}::text AS secret_key,
         ${coinBase}::text AS coin,
-        ${poolBase}::text AS pool,
+        ${poolVal}::text AS pool,
         ${lockedVal}::boolean AS locked
-      FROM generate_series(1, ${count})
+      FROM generate_series(1, ${count}) AS gs(n)
       RETURNING id
     `;
-
-    // Se usaste patterns, atualiza nome/worker_name já com {n} substituído (evita string-building no INSERT acima)
-    if (nomePattern || workerPattern) {
-      await sql/*sql*/`
-        WITH rows AS (
-          SELECT id, row_number() OVER (ORDER BY id) AS rn
-          FROM miners
-          WHERE user_id = ${user_id}
-          ORDER BY id DESC
-          LIMIT ${count}
-        )
-        UPDATE miners m
-        SET
-          nome = COALESCE(${nomePattern ? sql`REPLACE(${nomePattern}, '{n}', rows.rn::text)` : sql`m.nome`}, m.nome),
-          worker_name = COALESCE(${workerPattern ? sql`REPLACE(${workerPattern}, '{n}', rows.rn::text)` : sql`m.worker_name`}, m.worker_name)
-        FROM rows
-        WHERE m.id = rows.id
-      `;
-    }
 
     invalidateUserList(user_id);
     res.status(201).json({ ok: true, inserted: inserted.length });
@@ -271,10 +257,8 @@ router.post("/users/:userId/miners/bulk", async (req, res) => {
 
 /**
  * PATCH /api/staff/miners/:id
- * Atualiza qualquer campo do miner (staff/admin).
  */
 router.patch("/miners/:id", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const id = parseIntIdOr400Param(req, res, "id");
   if (id === null) return;
 
@@ -296,12 +280,14 @@ router.patch("/miners/:id", async (req, res) => {
   } = req.body || {};
 
   try {
-    let hashRateNum, precoKwNum, consumoNum, hoursNum;
+    let hashRateNum, precoKwNum, consumoNum, hoursNum, statusVal, poolVal;
     try {
       if (hash_rate !== undefined) hashRateNum = normalizeDecimal(hash_rate);
       if (preco_kw !== undefined)  precoKwNum  = normalizeDecimal(preco_kw);
       if (consumo_kw_hora !== undefined) consumoNum = normalizeDecimal(consumo_kw_hora);
       if (total_horas_online !== undefined) hoursNum = normalizeDecimal(total_horas_online);
+      if (status !== undefined) statusVal = ensureStatus(status);
+      if (pool !== undefined)   poolVal   = ensurePool(pool);
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
@@ -309,21 +295,21 @@ router.patch("/miners/:id", async (req, res) => {
     const [updated] = await sql/*sql*/`
       UPDATE miners
       SET
-        user_id           = COALESCE(${user_id ?? null}, user_id),
-        nome              = COALESCE(${nome !== undefined ? String(nome).trim() : null}, nome),
-        modelo            = COALESCE(${modelo !== undefined ? String(modelo).trim() : null}, modelo),
-        hash_rate         = COALESCE(${hashRateNum ?? null}, hash_rate),
-        preco_kw          = COALESCE(${precoKwNum ?? null}, preco_kw),
-        consumo_kw_hora   = COALESCE(${consumoNum ?? null}, consumo_kw_hora),
-        status            = COALESCE(${status !== undefined ? String(status).toLowerCase() : null}, status),
-        worker_name       = COALESCE(${worker_name ?? null}, worker_name),
-        api_key           = COALESCE(${api_key ?? null}, api_key),
-        secret_key        = COALESCE(${secret_key ?? null}, secret_key),
-        coin              = COALESCE(${coin ?? null}, coin),
-        pool              = COALESCE(${pool ?? null}, pool),
-        locked            = COALESCE(${locked ?? null}, locked),
+        user_id            = COALESCE(${user_id ?? null}, user_id),
+        nome               = COALESCE(${nome !== undefined ? String(nome).trim() : null}, nome),
+        modelo             = COALESCE(${modelo !== undefined ? String(modelo).trim() : null}, modelo),
+        hash_rate          = COALESCE(${hashRateNum ?? null}, hash_rate),
+        preco_kw           = COALESCE(${precoKwNum ?? null}, preco_kw),
+        consumo_kw_hora    = COALESCE(${consumoNum ?? null}, consumo_kw_hora),
+        status             = COALESCE(${statusVal ?? null}, status),
+        worker_name        = COALESCE(${worker_name ?? null}, worker_name),
+        api_key            = COALESCE(${api_key ?? null}, api_key),
+        secret_key         = COALESCE(${secret_key ?? null}, secret_key),
+        coin               = COALESCE(${coin ?? null}, coin),
+        pool               = COALESCE(${poolVal ?? null}, pool),
+        locked             = COALESCE(${locked ?? null}, locked),
         total_horas_online = COALESCE(${hoursNum ?? null}, total_horas_online),
-        updated_at        = NOW()
+        updated_at         = NOW()
       WHERE id = ${id}
       RETURNING *
     `;
@@ -340,7 +326,6 @@ router.patch("/miners/:id", async (req, res) => {
  * DELETE /api/staff/miners/:id
  */
 router.delete("/miners/:id", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const id = parseIntIdOr400Param(req, res, "id");
   if (id === null) return;
   try {
@@ -359,21 +344,19 @@ router.delete("/miners/:id", async (req, res) => {
  * Body: { status: 'online'|'offline'|'maintenance' }
  */
 router.post("/miners/:id/status", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const id = parseIntIdOr400Param(req, res, "id");
   if (id === null) return;
 
-  const { status } = req.body || {};
-  if (status !== undefined) {
-    const clean = String(status).toLowerCase();
-    if (!["online", "offline", "maintenance"].includes(clean)) {
-      return res.status(400).json({ error: "Status inválido (use 'online'|'offline'|'maintenance')." });
-    }
+  let clean;
+  try {
+    clean = ensureStatus(req.body?.status);
+  } catch (e) {
+    return res.status(400).json({ error: String(e.message || e) });
   }
   try {
     const [updated] = await sql/*sql*/`
       UPDATE miners
-      SET status = ${status}, updated_at = NOW()
+      SET status = ${clean}, updated_at = NOW()
       WHERE id = ${id}
       RETURNING id, user_id, status
     `;
@@ -393,8 +376,6 @@ router.post("/miners/:id/status", async (req, res) => {
  * ?includeCurrent=1 para inserir o “em_curso” no topo.
  */
 router.get("/users/:userId/invoices", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
-
   const userId = String(req.params.userId || "");
   const includeCurrent = String(req.query.includeCurrent || "") === "1";
   if (!userId) return res.status(400).json({ error: "userId em falta" });
@@ -402,8 +383,8 @@ router.get("/users/:userId/invoices", async (req, res) => {
   try {
     const saved = await sql/*sql*/`
       SELECT id, year, month,
-             COALESCE(subtotal_amount,0) AS subtotal_amount,
-             COALESCE(status,'pendente') AS status,
+             COALESCE(subtotal_amount,0)   AS subtotal_amount,
+             COALESCE(status,'pendente')   AS status,
              COALESCE(currency_code,'USD') AS currency_code,
              created_at
       FROM energy_invoices
@@ -467,17 +448,15 @@ router.get("/users/:userId/invoices", async (req, res) => {
 
 /**
  * GET /api/staff/users/:userId/invoices/current/summary
- * Snapshot rápido do mês corrente (kWh, horas, subtotal).
  */
 router.get("/users/:userId/invoices/current/summary", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
   try {
     const rows = await sql/*sql*/`
       SELECT
-        COALESCE(SUM(total_horas_online),0)                        AS total_hours,
+        COALESCE(SUM(total_horas_online),0) AS total_hours,
         COALESCE(SUM(total_horas_online * COALESCE(consumo_kw_hora,0)),0) AS total_kwh,
         COALESCE(SUM(
           ROUND(total_horas_online * COALESCE(consumo_kw_hora,0), 3) * COALESCE(preco_kw,0)
@@ -501,11 +480,9 @@ router.get("/users/:userId/invoices/current/summary", async (req, res) => {
  * GET /api/staff/users/:userId/invoices/detail
  * - em curso:   ?current=1
  * - fechada:    ?invoiceId=123
- * - retro:      ?year=YYYY&month=M (mais recente do mês)
+ * - retro:      ?year=YYYY&month=M
  */
 router.get("/users/:userId/invoices/detail", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
-
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
@@ -577,7 +554,7 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
       });
     }
 
-    // fechada
+    // fechada/retro
     let invRow;
     if (invoiceId) {
       const rows = await sql/*sql*/`
@@ -663,10 +640,9 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
 
 /**
  * POST /api/staff/users/:userId/invoices/close-now
- * Fecha a fatura “em curso” do user (com mínimo).
+ * Fecha a fatura “em curso” do user (mínimo 15 USD).
  */
 router.post("/users/:userId/invoices/close-now", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
@@ -755,7 +731,6 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
  * GET /api/staff/invoices/status?invoiceId=123
  */
 router.get("/invoices/status", async (req, res) => {
-  if (!requireStaffOrAdmin(req, res)) return;
   const invoiceId = Number(req.query.invoiceId);
   if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
 
