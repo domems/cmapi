@@ -944,5 +944,115 @@ router.patch("/users/:userId/invoices/:invoiceId/status", async (req, res) => {
   }
 });
 
+/* ---------- INVOICE FLAGS (overdue ≠ paid/canceled) ---------- */
+/**
+ * Consideramos “por liquidar” todas as faturas com estado
+ * DIFERENTE de 'pago' e 'cancelado'.
+ * A métrica é a idade (em dias) da fatura por liquidar mais antiga.
+ */
+
+function daysFromIntervalExpr(expr) {
+  // devolve um SQL que converte um interval em dias inteiros (floor)
+  return sql`FLOOR(EXTRACT(EPOCH FROM ${expr}) / 86400.0)`;
+}
+
+/**
+ * GET /api/staff/users/:userId/invoices/flags
+ * Resposta:
+ *   { user_id, oldest_unsettled_days: number|null, has_overdue_5d: boolean }
+ */
+router.get("/users/:userId/invoices/flags", async (req, res) => {
+  const userId = String(req.params.userId || "");
+  if (!userId) return res.status(400).json({ error: "userId em falta" });
+
+  try {
+    const rows = await sql/*sql*/`
+      SELECT
+        ${userId}::text AS user_id,
+        MIN(created_at) FILTER (WHERE status NOT IN ('pago','cancelado')) AS oldest_unsettled_created_at
+      FROM energy_invoices
+      WHERE user_id = ${userId}
+    `;
+
+    const row = rows[0] || {};
+    const oldest = row.oldest_unsettled_created_at;
+
+    let oldest_unsettled_days = null;
+    if (oldest) {
+      const [{ d }] = await sql/*sql*/`SELECT ${daysFromIntervalExpr(sql`NOW() - ${oldest}`)} AS d`;
+      oldest_unsettled_days = Number(d);
+    }
+
+    res.json({
+      user_id: userId,
+      oldest_unsettled_days,
+      has_overdue_5d: typeof oldest_unsettled_days === "number" ? oldest_unsettled_days > 5 : false,
+    });
+  } catch (e) {
+    error("GET /users/:userId/invoices/flags", e?.message || e);
+    res.status(500).json({ error: "Erro ao calcular flags de faturas" });
+  }
+});
+
+/**
+ * GET /api/staff/invoices/flags?userId=...&userId=...
+ * Resposta:
+ *   { items: [{ user_id, oldest_unsettled_days, has_overdue_5d }, ...] }
+ */
+router.get("/invoices/flags", async (req, res) => {
+  const userIds = []
+    .concat(req.query.userId || [])
+    .map(String)
+    .filter(Boolean);
+
+  try {
+    let rows;
+    if (userIds.length > 0) {
+      rows = await sql/*sql*/`
+        WITH base AS (
+          SELECT user_id::text, MIN(created_at) AS oldest_unsettled_created_at
+          FROM energy_invoices
+          WHERE status NOT IN ('pago','cancelado')
+            AND user_id = ANY(${userIds})
+          GROUP BY user_id
+        )
+        SELECT
+          user_id,
+          ${daysFromIntervalExpr(sql`NOW() - oldest_unsettled_created_at`)} AS oldest_unsettled_days
+        FROM base
+      `;
+    } else {
+      rows = await sql/*sql*/`
+        WITH base AS (
+          SELECT user_id::text, MIN(created_at) AS oldest_unsettled_created_at
+          FROM energy_invoices
+          WHERE status NOT IN ('pago','cancelado')
+          GROUP BY user_id
+          ORDER BY MIN(created_at) ASC
+          LIMIT 1000
+        )
+        SELECT
+          user_id,
+          ${daysFromIntervalExpr(sql`NOW() - oldest_unsettled_created_at`)} AS oldest_unsettled_days
+        FROM base
+      `;
+    }
+
+    const items = rows.map(r => {
+      const d = r.oldest_unsettled_days == null ? null : Number(r.oldest_unsettled_days);
+      return {
+        user_id: String(r.user_id),
+        oldest_unsettled_days: d,
+        has_overdue_5d: typeof d === "number" ? d > 5 : false,
+      };
+    });
+
+    res.json({ items });
+  } catch (e) {
+    error("GET /invoices/flags", e?.message || e);
+    res.status(500).json({ error: "Erro ao calcular flags de faturas (bulk)" });
+  }
+});
+
 
 export default router;
