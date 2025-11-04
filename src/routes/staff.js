@@ -20,37 +20,54 @@ import {
   revokeStaff,
 } from "../controllers/staffUsersController.js";
 
+// ⬇️ Sub-router com endpoints /users/:userId/miners e /users/:userId/invoices
+// (já inclui também POST /miners/:id/status e GET /invoices/status)
+import staffMinersInvoicesRouter from "../controllers/staffMinersInvoicesController.js";
+
 const router = Router();
 
-// Health
+/* ---------- Health ---------- */
 router.get("/ping", ping);
 
-// KPIs globais
+/* ---------- KPIs globais ---------- */
 router.get("/stats/miners", statsMiners);
 
-// Resumo mês corrente (kWh, horas, subtotal)
+/* ---------- Resumo mês corrente (kWh, horas, subtotal) ---------- */
 router.get("/invoices/current/summary", currentSummary);
 
-// Lista global de faturas (+ ?includeCurrent=1)
+/* ---------- Lista global de faturas (+ ?includeCurrent=1) ---------- */
 router.get("/invoices", listarFaturasGlobais);
 
-// Notificações por ler (global)
+/* ---------- Notificações por ler (global) ---------- */
 router.get("/notifications/unread_count", notificationsUnreadCount);
 
-// Miners globais (com ETag, paginação e ?coin=BTC)
+/* ---------- Miners globais (com ETag, paginação e ?coin=BTC) ---------- */
 router.get("/miners", listarMinersGlobais);
 
-// Status helpers (batch e por ID)
+/* ---------- Status helpers (batch e por ID) ---------- */
 router.get("/miners-status", obterStatusBatch);
 router.get("/miners/:id/status", obterStatusPorId);
 
+/* ---------- Timeline de eventos de estado ---------- */
 router.get("/miner-state-events", listarMinerStateEvents);
 
-// 👇 NOVO: gestão de utilizadores
+/* ---------- Gestão de utilizadores (staff/admin) ---------- */
 router.get("/users", listStaffUsers);
 router.post("/users/:id/lock", lockUser);
 router.post("/users/:id/unlock", unlockUser);
 router.post("/users/:id/make-staff", makeStaff);
 router.post("/users/:id/revoke-staff", revokeStaff);
+
+/* ---------- Sub-rotas: gestão de miners e faturas por utilizador ---------- */
+/*
+   Fornece:
+   GET  /users/:userId/miners
+   POST /miners/:id/status            { status: 'online'|'offline'|'maintenance' }
+   GET  /users/:userId/invoices?includeCurrent=1
+   GET  /users/:userId/invoices/detail?current=1 | ?invoiceId=123 | ?year=YYYY&month=M
+   POST /users/:userId/invoices/close-now
+   GET  /invoices/status?invoiceId=123
+*/
+router.use(staffMinersInvoicesRouter);
 
 export default router;
