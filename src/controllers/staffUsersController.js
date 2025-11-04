@@ -137,12 +137,19 @@ function toSafeUser(u, lockedMap) {
   const email = primaryEmailFromClerkUser(u);
   const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || null;
 
-  // Clerk devolve timestamps em segundos (Unix epoch)
+  // Clerk usa epoch seconds
   const created_at = epochToIso(u?.created_at);
   const last_active_at = epochToIso(u?.last_active_at);
+  const last_sign_in_at = epochToIso(u?.last_sign_in_at); // extra robustez
 
-  const invited = !u?.last_active_at;
-  const baseStatus = invited ? "invited" : "active";
+  // invited = nunca teve atividade (sem last_active_at e sem last_sign_in_at)
+  const isInvited = !u?.last_active_at && !u?.last_sign_in_at;
+
+  // suspended = Clerk banido/locked (estado administrativo do Clerk)
+  const clerkSuspended = !!(u?.banned || u?.locked);
+
+  // locked (tua flag local) vence sobre tudo
+  const locked = !!lockedMap.get(u.id);
 
   const meta_role_raw = String(u?.public_metadata?.role ?? "").toLowerCase();
   const meta_role =
@@ -150,25 +157,28 @@ function toSafeUser(u, lockedMap) {
     meta_role_raw === "staff" ? "staff" :
     "user";
 
-  // role base (compat com UI existente)
   const role = meta_role === "staff" ? "staff" : "user";
   const is_admin = meta_role === "admin";
 
-  const locked = !!lockedMap.get(u.id);
+  let status = "active";
+  if (locked) status = "locked";
+  else if (clerkSuspended) status = "suspended";
+  else if (isInvited) status = "invited";
 
   return {
     id: u.id,
     email,
     name,
-    role,                 // "user" | "staff" (compat/UI)
+    role,                 // "user" | "staff" (para UI)
     meta_role,            // "user" | "staff" | "admin"
     is_admin,             // boolean
-    status: locked ? "locked" : baseStatus,
-    created_at,           // ISO string ou null
-    last_active_at,       // ISO string ou null
+    status,               // "locked" | "suspended" | "invited" | "active"
+    created_at,
+    last_active_at: last_active_at || last_sign_in_at || null,
     locked,
   };
 }
+
 
 /* ===== GET /staff/users ===== */
 export async function listStaffUsers(req, res) {
