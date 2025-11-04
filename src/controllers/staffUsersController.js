@@ -82,6 +82,7 @@ function genReqId() { return Math.random().toString(36).slice(2) + Date.now().to
 async function clerkFetch(path, init = {}) {
   if (!CLERK_SECRET_KEY) {
     const e = new Error("CLERK_SECRET_KEY not set");
+    // @ts-ignore
     e.code = "CONFIG";
     throw e;
   }
@@ -98,14 +99,18 @@ async function clerkFetch(path, init = {}) {
   if (res.status === 429) {
     const retry = Math.min(Math.max(Number(res.headers.get("Retry-After")) || 60, 5), 300);
     const err = new Error("RATE_LIMIT");
+    // @ts-ignore
     err.retryAfter = retry;
+    // @ts-ignore
     err.status = 429;
     throw err;
   }
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     const err = new Error(`Clerk ${res.status}: ${body || "<empty>"}`);
+    // @ts-ignore
     err.status = res.status;
+    // @ts-ignore
     err.body = body;
     throw err;
   }
@@ -113,11 +118,17 @@ async function clerkFetch(path, init = {}) {
 }
 
 /* ===== Mapping helpers ===== */
-function epochToIso(sec) {
-  if (!sec && sec !== 0) return null;
-  const ms = Number(sec) * 1000;
-  if (!Number.isFinite(ms) || ms <= 0) return null;
-  return new Date(ms).toISOString();
+
+// Conversor robusto que aceita milissegundos (Clerk) OU segundos (outros)
+function tsToIso(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  // Heurística: < 1e11 é segundos (até ~2033). Clerk envia em ms.
+  const ms = n < 1e11 ? n * 1000 : n;
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString();
 }
 
 function primaryEmailFromClerkUser(u) {
@@ -132,31 +143,32 @@ function primaryEmailFromClerkUser(u) {
   return list[0]?.email_address || "";
 }
 
-/** Converte o user do Clerk para o payload da app, preservando admin/staff/user e datas em ISO. */
+/** Converte o user do Clerk para o payload da app, preservando admin/staff/user e datas em ISO verdadeiras. */
 function toSafeUser(u, lockedMap) {
   const email = primaryEmailFromClerkUser(u);
   const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || null;
 
-  // Clerk usa epoch seconds
-  const created_at = epochToIso(u?.created_at);
-  const last_active_at = epochToIso(u?.last_active_at);
-  const last_sign_in_at = epochToIso(u?.last_sign_in_at); // extra robustez
+  // Clerk envia timestamps em MILLIseconds (mas blindamos seg->ms)
+  const created_at   = tsToIso(u?.created_at);
+  const last_active  = tsToIso(u?.last_active_at);
+  const last_sign_in = tsToIso(u?.last_sign_in_at);
+  const updated_at   = tsToIso(u?.updated_at);
 
   // invited = nunca teve atividade (sem last_active_at e sem last_sign_in_at)
   const isInvited = !u?.last_active_at && !u?.last_sign_in_at;
 
-  // suspended = Clerk banido/locked (estado administrativo do Clerk)
+  // suspended = ban/locked do Clerk (estado administrativo no provider)
   const clerkSuspended = !!(u?.banned || u?.locked);
 
-  // locked (tua flag local) vence sobre tudo
+  // locked local (tabela sombra) vence sobre tudo
   const locked = !!lockedMap.get(u.id);
 
   const meta_role_raw = String(u?.public_metadata?.role ?? "").toLowerCase();
   const meta_role =
     meta_role_raw === "admin" ? "admin" :
-    meta_role_raw === "staff" ? "staff" :
-    "user";
+    meta_role_raw === "staff" ? "staff" : "user";
 
+  // Para a UI base, só "staff" | "user". Admin é um flag separado.
   const role = meta_role === "staff" ? "staff" : "user";
   const is_admin = meta_role === "admin";
 
@@ -169,16 +181,16 @@ function toSafeUser(u, lockedMap) {
     id: u.id,
     email,
     name,
-    role,                 // "user" | "staff" (para UI)
+    role,                 // "user" | "staff" (compat com UI)
     meta_role,            // "user" | "staff" | "admin"
     is_admin,             // boolean
     status,               // "locked" | "suspended" | "invited" | "active"
-    created_at,
-    last_active_at: last_active_at || last_sign_in_at || null,
+    created_at,           // ISO verdadeiro
+    // “Melhor esforço” para last activity visível em UI:
+    last_active_at: last_active || last_sign_in || updated_at || null,
     locked,
   };
 }
-
 
 /* ===== GET /staff/users ===== */
 export async function listStaffUsers(req, res) {
@@ -197,15 +209,15 @@ export async function listStaffUsers(req, res) {
     const params = new URLSearchParams();
     params.set("limit", String(pageSize));
     params.set("offset", String(offset));
-    // Clerk agora aceita order: created_at/updated_at (asc/desc). Mantemos simples.
-    // (Se quiseres, podes usar &order_by=created_at&order_direction=desc no Clerk)
+    // Se pesquisa por email exato, deixa o Clerk filtrar
     if (qRaw && looksLikeEmail(qRaw)) {
       params.append("email_address", qRaw);
     }
-    // NOTA: se quiseres procurar por nome/ID no Clerk, terás de paginar e filtrar client-side (o que já fazes)
+    // NOTA: para nome/ID, tens de filtrar localmente (já fazemos)
 
     let data;
     try {
+      // Clerk: /users devolve { data: [...], total_count, ... } (dependendo da versão)
       data = await clerkFetch(`/users?${params.toString()}`);
     } catch (e) {
       if (e && e.message === "RATE_LIMIT") {
