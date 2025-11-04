@@ -5,7 +5,6 @@ import { setCachedList, invalidateUserList } from "../services/minersListCache.j
 
 /* ===================== Utils ===================== */
 const TAG = "[STAFF-MINERS+INVOICES]";
-
 function log(...a)   { try { console.log(TAG, ...a); } catch {} }
 function warn(...a)  { try { console.warn(TAG, ...a); } catch {} }
 function error(...a) { try { console.error(TAG, ...a); } catch {} }
@@ -48,28 +47,42 @@ function normalizeDecimal(input) {
 }
 
 const ALLOWED_STATUS = new Set(["online", "offline", "maintenance"]);
-const ALLOWED_POOLS = new Set(["ViaBTC", "LiteCoinPool"]);
+const ALLOWED_POOLS  = new Set(["ViaBTC", "LiteCoinPool"]);
 
 function ensureStatus(val) {
   if (val === undefined || val === null || val === "") return null;
   const v = String(val).toLowerCase();
-  if (!ALLOWED_STATUS.has(v)) {
-    throw new Error("Status inválido (use 'online'|'offline'|'maintenance').");
-  }
+  if (!ALLOWED_STATUS.has(v)) throw new Error("Status inválido (use 'online'|'offline'|'maintenance').");
   return v;
 }
-function ensurePool(val) {
+function canonicalPool(val) {
   if (val === undefined || val === null || val === "") return null;
-  const v = String(val);
-  if (!ALLOWED_POOLS.has(v)) {
-    throw new Error("Pool inválida (use 'ViaBTC' ou 'LiteCoinPool').");
-  }
+  const v = String(val).trim();
+  if (/^viabtc$/i.test(v)) return "ViaBTC";
+  if (/^lite\s*coin\s*pool$/i.test(v) || /^litecoinpool$/i.test(v)) return "LiteCoinPool";
+  if (!ALLOWED_POOLS.has(v)) throw new Error("Pool inválida (use 'ViaBTC' ou 'LiteCoinPool').");
   return v;
 }
 function redactSecrets(row, allowSecrets) {
   if (allowSecrets) return row;
   const { api_key, secret_key, ...rest } = row || {};
   return { ...rest, api_key: null, secret_key: null };
+}
+
+function getRoleLoose(req) {
+  return String(
+    req.auth?.sessionClaims?.metadata?.role ||
+    req.auth?.claims?.metadata?.role ||
+    req.user?.publicMetadata?.role ||
+    req.headers["x-user-role"] ||
+    req.headers["x-role"] ||
+    ""
+  ).toLowerCase();
+}
+function allowReveal(req) {
+  // Rotas já protegidas a montante, mas isto evita leaks caso alguém mexa no server.js
+  const role = getRoleLoose(req);
+  return role === "staff" || role === "admin";
 }
 
 /* ===================== Router ===================== */
@@ -79,17 +92,20 @@ const router = express.Router();
 
 /**
  * GET /api/staff/users/:userId/miners
- * Lista miners do utilizador alvo (ETag + 304).
- * ?reveal=1 para incluir api_key/secret_key.
+ * Query: ?reveal=1 (apenas staff/admin)
+ * Paginação opcional: ?limit=&offset=
  */
 router.get("/users/:userId/miners", async (req, res) => {
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
-  const reveal = String(req.query.reveal || "") === "1";
+  const revealFlag = String(req.query.reveal || "") === "1";
+  const reveal = revealFlag && allowReveal(req); // endurecido, sem partir o frontend
+  const limit = Math.max(1, Math.min(1000, Number(req.query.limit) || 0)) || null; // opcional
+  const offset = Math.max(0, Number(req.query.offset) || 0);
 
   try {
-    const miners = await sql/*sql*/`
+    const rows = await sql/*sql*/`
       SELECT
         id, user_id, nome, modelo, hash_rate,
         preco_kw, consumo_kw_hora,
@@ -99,16 +115,17 @@ router.get("/users/:userId/miners", async (req, res) => {
       FROM miners
       WHERE user_id = ${userId}
       ORDER BY created_at DESC, id DESC
+      ${limit ? sql`LIMIT ${limit} OFFSET ${offset}` : sql``}
     `;
-    const safe = miners.map(r => redactSecrets(r, reveal));
+    const safe = rows.map(r => redactSecrets(r, reveal));
 
-    const { etag } = setCachedList(`u:${userId}:reveal:${reveal ? 1 : 0}`, safe);
+    const { etag } = setCachedList(`u:${userId}:reveal:${reveal ? 1 : 0}:limit:${limit||"all"}:offset:${offset}`, safe);
     const inm = req.headers["if-none-match"];
     if (inm && inm === etag) return res.status(304).end();
 
     res.setHeader("ETag", etag);
     res.setHeader("Cache-Control", "private, max-age=10, stale-while-revalidate=60");
-    res.setHeader("Vary", "Authorization, Accept-Encoding");
+    res.setHeader("Vary", "Authorization, Accept, Accept-Encoding");
     res.json(safe);
   } catch (e) {
     error("GET /users/:userId/miners", e?.message || e);
@@ -143,18 +160,18 @@ router.post("/users/:userId/miners", async (req, res) => {
     const nomeClean = String(nome || "").trim();
     if (!nomeClean) return res.status(400).json({ error: "Campo obrigatório em falta: nome." });
 
-    let hashRateNum = null, precoKwNum = null, consumoNum = null;
+    let hashRateNum = null, precoKwNum = null, consumoNum = null, poolVal = null, statusVal = null;
     try {
       hashRateNum = normalizeDecimal(hash_rate);
       precoKwNum  = normalizeDecimal(preco_kw);
       consumoNum  = normalizeDecimal(consumo_kw_hora);
+      statusVal   = ensureStatus(status) ?? "offline";
+      poolVal     = canonicalPool(pool);
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
 
     const lockedVal = typeof locked === "boolean" ? locked : true;
-    const statusVal = ensureStatus(status) ?? "offline";
-    const poolVal   = ensurePool(pool);
 
     const [row] = await sql/*sql*/`
       INSERT INTO miners (
@@ -177,7 +194,7 @@ router.post("/users/:userId/miners", async (req, res) => {
       )
       RETURNING *
     `;
-    invalidateUserList(user_id);
+    invalidateUserList(user_id); // deve invalidar todos os variants
     res.status(201).json(row);
   } catch (e) {
     error("POST /users/:userId/miners", e?.message || e);
@@ -193,13 +210,13 @@ router.post("/users/:userId/miners/bulk", async (req, res) => {
   const user_id = String(req.params.userId || "");
   if (!user_id) return res.status(400).json({ error: "userId em falta" });
 
-  const countRaw = req.body?.count;
-  const values = req.body?.values || {};
-  const patterns = req.body?.patterns || {};
-  const count = Number(countRaw);
+  const count = Number(req.body?.count);
   if (!Number.isInteger(count) || count < 1 || count > 200) {
     return res.status(400).json({ error: "count inválido (1..200)" });
   }
+
+  const values = req.body?.values || {};
+  const patterns = req.body?.patterns || {};
 
   try {
     const nomeBase       = values?.nome ? String(values.nome).trim() : null;
@@ -212,7 +229,7 @@ router.post("/users/:userId/miners/bulk", async (req, res) => {
     const apiKeyBase     = values?.api_key ? String(values.api_key).trim() : null;
     const secretKeyBase  = values?.secret_key ? String(values.secret_key).trim() : null;
     const coinBase       = values?.coin ? String(values.coin).trim() : null;
-    const poolVal        = ensurePool(values?.pool);
+    const poolVal        = canonicalPool(values?.pool);
     const lockedVal      = typeof values?.locked === "boolean" ? values.locked : true;
 
     const nomePattern   = patterns?.nomePattern ? String(patterns.nomePattern) : null;
@@ -257,6 +274,7 @@ router.post("/users/:userId/miners/bulk", async (req, res) => {
 
 /**
  * PATCH /api/staff/miners/:id
+ * — invalida cache do user antigo e do novo se moveres a máquina
  */
 router.patch("/miners/:id", async (req, res) => {
   const id = parseIntIdOr400Param(req, res, "id");
@@ -280,14 +298,17 @@ router.patch("/miners/:id", async (req, res) => {
   } = req.body || {};
 
   try {
+    const [before] = await sql/*sql*/`SELECT user_id FROM miners WHERE id = ${id} LIMIT 1`;
+    if (!before) return res.status(404).json({ error: "Miner não encontrada." });
+
     let hashRateNum, precoKwNum, consumoNum, hoursNum, statusVal, poolVal;
     try {
-      if (hash_rate !== undefined) hashRateNum = normalizeDecimal(hash_rate);
-      if (preco_kw !== undefined)  precoKwNum  = normalizeDecimal(preco_kw);
-      if (consumo_kw_hora !== undefined) consumoNum = normalizeDecimal(consumo_kw_hora);
-      if (total_horas_online !== undefined) hoursNum = normalizeDecimal(total_horas_online);
-      if (status !== undefined) statusVal = ensureStatus(status);
-      if (pool !== undefined)   poolVal   = ensurePool(pool);
+      if (hash_rate !== undefined)        hashRateNum = normalizeDecimal(hash_rate);
+      if (preco_kw !== undefined)         precoKwNum  = normalizeDecimal(preco_kw);
+      if (consumo_kw_hora !== undefined)  consumoNum  = normalizeDecimal(consumo_kw_hora);
+      if (total_horas_online !== undefined) hoursNum  = normalizeDecimal(total_horas_online);
+      if (status !== undefined)           statusVal   = ensureStatus(status);
+      if (pool !== undefined)             poolVal     = canonicalPool(pool);
     } catch (e) {
       return res.status(400).json({ error: String(e.message || e) });
     }
@@ -314,7 +335,13 @@ router.patch("/miners/:id", async (req, res) => {
       RETURNING *
     `;
     if (!updated) return res.status(404).json({ error: "Miner não encontrada." });
-    if (updated?.user_id) invalidateUserList(String(updated.user_id));
+
+    // invalida caches do user antigo e do novo (se alterado)
+    const oldUser = String(before.user_id);
+    const newUser = String(updated.user_id);
+    invalidateUserList(oldUser);
+    if (newUser !== oldUser) invalidateUserList(newUser);
+
     res.json(updated);
   } catch (e) {
     error("PATCH /miners/:id", e?.message || e);
@@ -408,6 +435,8 @@ router.get("/users/:userId/invoices", async (req, res) => {
         FROM energy_invoices
         WHERE user_id = ${userId}
       `;
+      const preferredCurrency = String(currencyRow?.currency_code || "USD");
+
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -428,13 +457,14 @@ router.get("/users/:userId/invoices", async (req, res) => {
         return { amount_eur: amount };
       });
       const subtotal = +items.reduce((acc, it) => acc + Number(it.amount_eur || 0), 0).toFixed(2);
+
       rows.unshift({
         id: undefined,
         year,
         month,
         subtotal_amount: subtotal,
         status: "em_curso",
-        currency_code: String(currencyRow?.currency_code || "USD"),
+        currency_code: preferredCurrency,
         created_at: null,
       });
     }
@@ -499,6 +529,8 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
         FROM energy_invoices
         WHERE user_id = ${userId}
       `;
+      const preferredCurrency = String(currencyRow?.currency_code || "USD");
+
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -547,7 +579,7 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
           month: m,
           status: "em_curso",
           subtotal_amount: subtotal,
-          currency_code: String(currencyRow?.currency_code || "USD"),
+          currency_code: preferredCurrency,
           total_kwh,
         },
         items,
@@ -641,85 +673,139 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
 /**
  * POST /api/staff/users/:userId/invoices/close-now
  * Fecha a fatura “em curso” do user (mínimo 15 USD).
+ * — transação + advisory lock para evitar duplicados em race
  */
 router.post("/users/:userId/invoices/close-now", async (req, res) => {
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
   const { year, month } = currentYearMonth();
-  try {
-    const miners = await sql/*sql*/`
-      SELECT
-        id,
-        COALESCE(nome, CONCAT('Miner#', id::text)) AS miner_nome,
-        COALESCE(total_horas_online,0)             AS hours_online,
-        COALESCE(consumo_kw_hora,0)                AS consumo_kw_hora,
-        COALESCE(preco_kw,0)                       AS preco_kw
-      FROM miners
-      WHERE user_id = ${userId}
-    `;
-    const subtotalCalc = miners.reduce((acc, r) => {
-      const hours = Number(r.hours_online) || 0;
-      const consumo = Number(r.consumo_kw_hora) || 0;
-      const preco = Number(r.preco_kw) || 0;
-      const kwh = +(hours * consumo).toFixed(3);
-      const amount = +(kwh * preco).toFixed(2);
-      return acc + amount;
-    }, 0);
-    const subtotalRoundedCheck = Math.round(subtotalCalc * 100) / 100;
 
-    const MIN_TOTAL = 15; // USD
-    if (subtotalRoundedCheck < MIN_TOTAL) {
-      return res.status(400).json({
-        error: "Fatura demasiado baixa para fechar",
-        min_required: MIN_TOTAL,
-        current_subtotal: subtotalRoundedCheck,
+  try {
+    const result = await sql.begin(async (tx) => {
+      // lock por user/mês (estável, sem schema extra)
+      const hashKey = Math.abs(
+        BigInt(
+          (String(userId) + ":" + year + ":" + month)
+            .split("")
+            .reduce((a, c) => ((a * 131) ^ c.charCodeAt(0)) >>> 0, 0)
+        )
+      );
+      await tx/*sql*/`SELECT pg_advisory_xact_lock(${hashKey})`;
+
+      // moeda preferida coerente com includeCurrent
+      const [currencyRow] = await tx/*sql*/`
+        SELECT COALESCE(MAX(currency_code),'USD') AS currency_code
+        FROM energy_invoices
+        WHERE user_id = ${userId}
+      `;
+      const preferredCurrency = String(currencyRow?.currency_code || "USD");
+
+      // já existe?
+      const [existing] = await tx/*sql*/`
+        SELECT id FROM energy_invoices
+        WHERE user_id = ${userId} AND year = ${year} AND month = ${month}
+        LIMIT 1
+      `;
+      if (existing) {
+        return { already: true, invoiceId: Number(existing.id), currency: preferredCurrency };
+      }
+
+      // calcula subtotal (tudo em SQL/NUMERIC seria o ideal; aqui somamos em app mas arredondamos igual)
+      const miners = await tx/*sql*/`
+        SELECT
+          id,
+          COALESCE(nome, CONCAT('Miner#', id::text)) AS miner_nome,
+          COALESCE(total_horas_online,0)             AS hours_online,
+          COALESCE(consumo_kw_hora,0)                AS consumo_kw_hora,
+          COALESCE(preco_kw,0)                       AS preco_kw
+        FROM miners
+        WHERE user_id = ${userId}
+      `;
+      const subtotalCalc = miners.reduce((acc, r) => {
+        const hours = Number(r.hours_online) || 0;
+        const consumo = Number(r.consumo_kw_hora) || 0;
+        const preco = Number(r.preco_kw) || 0;
+        const kwh = +(hours * consumo).toFixed(3);
+        const amount = +(kwh * preco).toFixed(2);
+        return acc + amount;
+      }, 0);
+      const subtotalRoundedCheck = Math.round(subtotalCalc * 100) / 100;
+
+      const MIN_TOTAL = 15; // USD
+      if (subtotalRoundedCheck < MIN_TOTAL) {
+        return { tooLow: true, min: MIN_TOTAL, current: subtotalRoundedCheck };
+      }
+
+      const insertedInv = await tx/*sql*/`
+        INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
+        VALUES (${userId}, ${year}, ${month}, 0, 'pendente', ${preferredCurrency})
+        RETURNING id, created_at
+      `;
+      const invoiceId = Number(insertedInv[0].id);
+
+      const insertedItems = await tx/*sql*/`
+        INSERT INTO energy_invoice_items
+          (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
+        SELECT
+          ${invoiceId},
+          m.id,
+          COALESCE(m.nome, CONCAT('Miner#', m.id::text)) AS miner_nome,
+          COALESCE(m.total_horas_online,0)               AS hours_online,
+          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
+          COALESCE(m.preco_kw,0)                         AS preco_kw,
+          COALESCE(m.consumo_kw_hora,0)                  AS consumo_kw_hora,
+          ROUND(
+            ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw,0),
+            2
+          ) AS amount_eur
+        FROM miners m
+        WHERE m.user_id = ${userId}
+        RETURNING amount_eur
+      `;
+      const itemsCount = insertedItems.length;
+      const subtotal = insertedItems.reduce((acc, r) => acc + Number(r.amount_eur || 0), 0);
+      const subtotalRounded = Math.round(subtotal * 100) / 100;
+
+      await tx/*sql*/`
+        UPDATE energy_invoices
+        SET subtotal_amount = ${subtotalRounded}::numeric,
+            updated_at = NOW(),
+            status = 'pendente'
+        WHERE id = ${invoiceId}
+      `;
+      await tx/*sql*/`UPDATE miners SET total_horas_online = 0 WHERE user_id = ${userId}`;
+
+      return { ok: true, invoiceId, itemsCount, subtotalRounded, currency: preferredCurrency };
+    });
+
+    if (result?.already) {
+      return res.json({
+        ok: true,
+        invoice: { id: result.invoiceId, year, month, status: "pendente" },
+        note: "Fatura do mês já existe",
       });
     }
-
-    const insertedInv = await sql/*sql*/`
-      INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
-      VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
-      RETURNING id, created_at
-    `;
-    const invoiceId = Number(insertedInv[0].id);
-
-    const insertedItems = await sql/*sql*/`
-      INSERT INTO energy_invoice_items
-        (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
-      SELECT
-        ${invoiceId},
-        m.id,
-        COALESCE(m.nome, CONCAT('Miner#', m.id::text)) AS miner_nome,
-        COALESCE(m.total_horas_online,0)               AS hours_online,
-        ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) AS kwh_used,
-        COALESCE(m.preco_kw,0)                         AS preco_kw,
-        COALESCE(m.consumo_kw_hora,0)                  AS consumo_kw_hora,
-        ROUND(
-          ROUND(COALESCE(m.total_horas_online,0) * COALESCE(m.consumo_kw_hora,0), 3) * COALESCE(m.preco_kw,0),
-          2
-        ) AS amount_eur
-      FROM miners m
-      WHERE m.user_id = ${userId}
-      RETURNING amount_eur
-    `;
-    const itemsCount = insertedItems.length;
-    const subtotal = insertedItems.reduce((acc, r) => acc + Number(r.amount_eur || 0), 0);
-    const subtotalRounded = Math.round(subtotal * 100) / 100;
-
-    await sql/*sql*/`
-      UPDATE energy_invoices
-      SET subtotal_amount = ${subtotalRounded}::numeric,
-          updated_at = NOW(),
-          status = 'pendente'
-      WHERE id = ${invoiceId}
-    `;
-    await sql/*sql*/`UPDATE miners SET total_horas_online = 0 WHERE user_id = ${userId}`;
+    if (result?.tooLow) {
+      return res.status(400).json({
+        error: "Fatura demasiado baixa para fechar",
+        min_required: result.min,
+        current_subtotal: result.current,
+      });
+    }
 
     invalidateUserList(userId);
     return res.json({
       ok: true,
-      invoice: { id: invoiceId, year, month, status: "pendente", items_count: itemsCount, subtotal_amount: subtotalRounded },
+      invoice: {
+        id: result.invoiceId,
+        year,
+        month,
+        status: "pendente",
+        items_count: result.itemsCount,
+        subtotal_amount: result.subtotalRounded,
+        currency_code: result.currency,
+      },
     });
   } catch (e) {
     error("POST /users/:userId/invoices/close-now", { code: e?.code, detail: e?.detail, message: e?.message });
