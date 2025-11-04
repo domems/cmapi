@@ -85,6 +85,26 @@ function allowReveal(req) {
   return role === "staff" || role === "admin";
 }
 
+/* ====== Invoice Status Helpers (PT storage) ====== */
+const PT_STATUS = new Set(["pendente", "pago", "cancelado", "em_curso"]);
+
+function canonInvoiceStatusPt(input) {
+  if (!input && input !== 0) throw new Error("Estado em falta.");
+  const v = String(input).trim().toLowerCase();
+
+  // já em PT
+  if (PT_STATUS.has(v)) return v;
+
+  // EN -> PT
+  if (v === "pending") return "pendente";
+  if (v === "paid") return "pago";
+  if (v === "canceled" || v === "cancelled") return "cancelado";
+  if (v === "in_progress" || v === "in progress") return "em_curso";
+
+  throw new Error(`Estado inválido: "${input}". Use pendente|pago|cancelado (ou EN: pending|paid|canceled).`);
+}
+
+
 /* ===================== Router ===================== */
 const router = express.Router();
 
@@ -856,5 +876,73 @@ router.get("/invoices/status", async (req, res) => {
     res.status(500).json({ error: "Erro ao consultar estado da fatura" });
   }
 });
+
+/**
+ * PATCH /api/staff/users/:userId/invoices/:invoiceId/status
+ * Body: { status: 'pending'|'paid'|'canceled' | 'pendente'|'pago'|'cancelado' }
+ * Grava SEMPRE em português na BD.
+ */
+router.patch("/users/:userId/invoices/:invoiceId/status", async (req, res) => {
+  const userId = String(req.params.userId || "");
+  const invoiceId = Number(req.params.invoiceId);
+
+  if (!userId)   return res.status(400).json({ error: "userId em falta" });
+  if (!Number.isInteger(invoiceId)) {
+    return res.status(400).json({ error: "invoiceId inválido (tem de ser inteiro)." });
+  }
+
+  let statusPt;
+  try {
+    statusPt = canonInvoiceStatusPt(req.body?.status);
+  } catch (e) {
+    return res.status(400).json({ error: String(e.message || e) });
+  }
+
+  // Regras de negócio: não aceitar 'em_curso' em faturas já fechadas
+  if (statusPt === "em_curso") {
+    return res.status(400).json({ error: "Não é permitido definir 'em_curso' numa fatura fechada." });
+  }
+
+  try {
+    // garantir que pertence ao user
+    const [exists] = await sql/*sql*/`
+      SELECT id, user_id, status
+      FROM energy_invoices
+      WHERE id = ${invoiceId} AND user_id = ${userId}
+      LIMIT 1
+    `;
+    if (!exists) return res.status(404).json({ error: "Fatura não encontrada para este utilizador." });
+
+    // update
+    const [row] = await sql/*sql*/`
+      UPDATE energy_invoices
+      SET status = ${statusPt}, updated_at = NOW()
+      WHERE id = ${invoiceId}
+      RETURNING id, user_id, year, month, subtotal_amount, status, currency_code, created_at, updated_at
+    `;
+
+    // Opcional: invalidar cache se tiveres ETag/redis para a lista de invoices (não tens neste ficheiro)
+    // ex: invalidateInvoicesList(userId)
+
+    return res.json({
+      ok: true,
+      invoice: {
+        id: Number(row.id),
+        user_id: String(row.user_id),
+        year: Number(row.year),
+        month: Number(row.month),
+        subtotal_amount: Number(row.subtotal_amount || 0),
+        status: String(row.status),              // PT
+        currency_code: String(row.currency_code || "USD"),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+      },
+    });
+  } catch (e) {
+    error("PATCH /users/:userId/invoices/:invoiceId/status", e?.message || e);
+    return res.status(500).json({ error: "Erro ao atualizar estado da fatura" });
+  }
+});
+
 
 export default router;
