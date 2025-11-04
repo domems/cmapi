@@ -95,14 +95,13 @@ const router = express.Router();
  * Query: ?reveal=1 (apenas staff/admin)
  * Paginação opcional: ?limit=&offset=
  */
+// GET /api/staff/users/:userId/miners
 router.get("/users/:userId/miners", async (req, res) => {
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
   const revealFlag = String(req.query.reveal || "") === "1";
-  const reveal = revealFlag && allowReveal(req); // endurecido, sem partir o frontend
-  const limit = Math.max(1, Math.min(1000, Number(req.query.limit) || 0)) || null; // opcional
-  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const reveal = revealFlag && allowReveal(req);
 
   try {
     const rows = await sql/*sql*/`
@@ -115,23 +114,43 @@ router.get("/users/:userId/miners", async (req, res) => {
       FROM miners
       WHERE user_id = ${userId}
       ORDER BY created_at DESC, id DESC
-      ${limit ? sql`LIMIT ${limit} OFFSET ${offset}` : sql``}
     `;
-    const safe = rows.map(r => redactSecrets(r, reveal));
 
-    const { etag } = setCachedList(`u:${userId}:reveal:${reveal ? 1 : 0}:limit:${limit||"all"}:offset:${offset}`, safe);
+    // <<< CRITICAL: normalize for RN keys and your UI >>>
+    const safeArray = rows.map(r => {
+      const cleaned = redactSecrets(r, reveal);
+      return {
+        ...cleaned,
+        // force primitives that RN relies on
+        id: Number(cleaned.id),                 // make sure it's a number, not null/undefined
+        user_id: String(cleaned.user_id || ""), // never null
+        status: String(cleaned.status || "offline").toLowerCase(),
+        preco_kw: cleaned.preco_kw == null ? null : Number(cleaned.preco_kw),
+        consumo_kw_hora: cleaned.consumo_kw_hora == null ? null : Number(cleaned.consumo_kw_hora),
+        total_horas_online: cleaned.total_horas_online == null ? null : Number(cleaned.total_horas_online),
+        locked: !!cleaned.locked,
+        created_at: cleaned.created_at || null,
+        updated_at: cleaned.updated_at || null,
+      };
+    }).filter(it => Number.isFinite(it.id)); // drop any bad rows defensively
+
+    const payload = { items: safeArray };
+
+    const { etag } = setCachedList(`u:${userId}:reveal:${reveal ? 1 : 0}`, payload);
     const inm = req.headers["if-none-match"];
     if (inm && inm === etag) return res.status(304).end();
 
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("ETag", etag);
     res.setHeader("Cache-Control", "private, max-age=10, stale-while-revalidate=60");
     res.setHeader("Vary", "Authorization, Accept, Accept-Encoding");
-    res.json(safe);
+    res.json(payload);
   } catch (e) {
     error("GET /users/:userId/miners", e?.message || e);
     res.status(500).json({ error: "Erro ao listar miners" });
   }
 });
+
 
 /**
  * POST /api/staff/users/:userId/miners
