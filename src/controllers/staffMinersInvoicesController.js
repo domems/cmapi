@@ -3,10 +3,14 @@ import express from "express";
 import { sql } from "../config/db.js";
 import { setCachedList, invalidateUserList } from "../services/minersListCache.js";
 
-/* ===================== Helpers ===================== */
+/* ===================== Utils & guards ===================== */
+const TAG = "[STAFF-MINERS+INVOICES]";
+
+function log(...a)   { try { console.log(TAG, ...a); } catch {} }
+function warn(...a)  { try { console.warn(TAG, ...a); } catch {} }
+function error(...a) { try { console.error(TAG, ...a); } catch {} }
 
 function isStaffOrAdmin(req) {
-  // Tenta várias fontes (Clerk middleware / proxies)
   const metaRole =
     req.auth?.sessionClaims?.metadata?.role ||
     req.auth?.claims?.metadata?.role ||
@@ -14,11 +18,9 @@ function isStaffOrAdmin(req) {
     req.headers["x-user-role"] ||
     req.headers["x-role"] ||
     "";
-
   const role = String(metaRole || "").toLowerCase();
   return role === "staff" || role === "admin";
 }
-
 function requireStaffOrAdmin(req, res) {
   if (!isStaffOrAdmin(req)) {
     res.status(403).json({ error: "Forbidden (staff/admin only)" });
@@ -26,7 +28,6 @@ function requireStaffOrAdmin(req, res) {
   }
   return true;
 }
-
 function parseIntIdOr400Param(req, res, key = "id") {
   const raw = req.params?.[key];
   const num = Number(raw);
@@ -36,23 +37,45 @@ function parseIntIdOr400Param(req, res, key = "id") {
   }
   return num;
 }
-
 function currentYearMonth() {
   const now = new Date();
   return { year: now.getFullYear(), month: now.getMonth() + 1 };
 }
+function normalizeDecimal(input) {
+  if (input === undefined || input === null || input === "") return null;
+  if (typeof input === "number") {
+    if (!Number.isFinite(input)) throw new Error(`Valor numérico inválido: "${input}"`);
+    return input;
+  }
+  const s0 = String(input).trim().replace(/\s+/g, "");
+  let s = s0;
+  const hasComma = s.includes(",");
+  const hasDot = s.includes(".");
+  if (hasComma && hasDot) {
+    const lastComma = s.lastIndexOf(",");
+    const lastDot = s.lastIndexOf(".");
+    const decSep = lastComma > lastDot ? "," : ".";
+    const thouSep = decSep === "," ? /\./g : /,/g;
+    s = s.replace(thouSep, "").replace(decSep, ".");
+  } else if (hasComma) {
+    s = s.replace(/\./g, "").replace(",", ".");
+  }
+  const n = Number(s);
+  if (!Number.isFinite(n)) throw new Error(`Valor numérico inválido: "${input}"`);
+  return n;
+}
 
 /* ===================== Router ===================== */
-
 const router = express.Router();
+
+/* ---------- MINERS (por utilizador alvo) ---------- */
 
 /**
  * GET /api/staff/users/:userId/miners
- * Lista os miners do utilizador alvo (para staff/admin), com ETag e 304.
+ * Lista miners do utilizador alvo (ETag + 304).
  */
 router.get("/users/:userId/miners", async (req, res) => {
   if (!requireStaffOrAdmin(req, res)) return;
-
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
@@ -63,26 +86,271 @@ router.get("/users/:userId/miners", async (req, res) => {
         preco_kw, consumo_kw_hora,
         COALESCE(status,'offline') AS status,
         worker_name, api_key, secret_key, coin, pool,
-        locked, created_at, updated_at
+        locked, total_horas_online, created_at, updated_at
       FROM miners
       WHERE user_id = ${userId}
-      ORDER BY created_at DESC;
+      ORDER BY created_at DESC, id DESC
     `;
-
     const { etag } = setCachedList(userId, miners);
     const inm = req.headers["if-none-match"];
     if (inm && inm === etag) {
       res.status(304).end();
       return;
     }
-
     res.setHeader("ETag", etag);
     res.setHeader("Cache-Control", "private, max-age=10, stale-while-revalidate=60");
-    res.setHeader("Vary", "Authorization, X-User-Email, X-User-Role, X-Role");
+    res.setHeader("Vary", "Authorization, X-User-Role, X-Role");
     res.json(miners);
   } catch (e) {
-    console.error("[STAFF] GET /users/:userId/miners ERROR:", e);
+    error("GET /users/:userId/miners", e?.message || e);
     res.status(500).json({ error: "Erro ao listar miners" });
+  }
+});
+
+/**
+ * POST /api/staff/users/:userId/miners
+ * Cria **um** miner para o utilizador alvo.
+ * Body: { nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status, worker_name, api_key, secret_key, coin, pool, locked }
+ */
+router.post("/users/:userId/miners", async (req, res) => {
+  if (!requireStaffOrAdmin(req, res)) return;
+  const user_id = String(req.params.userId || "");
+  if (!user_id) return res.status(400).json({ error: "userId em falta" });
+
+  const {
+    nome,
+    modelo,
+    hash_rate,
+    preco_kw,
+    consumo_kw_hora,
+    status,
+    worker_name,
+    api_key,
+    secret_key,
+    coin,
+    pool,
+    locked,
+  } = req.body || {};
+
+  try {
+    const nomeClean = String(nome || "").trim();
+    if (!nomeClean) return res.status(400).json({ error: "Campo obrigatório em falta: nome." });
+
+    let hashRateNum = null, precoKwNum = null, consumoNum = null;
+    try {
+      hashRateNum = normalizeDecimal(hash_rate);
+      precoKwNum = normalizeDecimal(preco_kw);
+      consumoNum  = normalizeDecimal(consumo_kw_hora);
+    } catch (e) {
+      return res.status(400).json({ error: String(e.message || e) });
+    }
+
+    const lockedVal = typeof locked === "boolean" ? locked : true;
+    const statusVal = status ? String(status).toLowerCase() : "offline";
+
+    const [row] = await sql/*sql*/`
+      INSERT INTO miners (
+        user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
+        worker_name, api_key, secret_key, coin, pool, locked
+      ) VALUES (
+        ${user_id},
+        ${nomeClean},
+        ${modelo ? String(modelo).trim() : null},
+        ${hashRateNum},
+        ${precoKwNum},
+        ${consumoNum},
+        ${statusVal},
+        ${worker_name ? String(worker_name).trim() : null},
+        ${api_key ? String(api_key).trim() : null},
+        ${secret_key ? String(secret_key).trim() : null},
+        ${coin ? String(coin).trim() : null},
+        ${pool ? String(pool).trim() : null},
+        ${lockedVal}
+      )
+      RETURNING *
+    `;
+    invalidateUserList(user_id);
+    res.status(201).json(row);
+  } catch (e) {
+    error("POST /users/:userId/miners", e?.message || e);
+    res.status(500).json({ error: "Erro ao criar miner" });
+  }
+});
+
+/**
+ * POST /api/staff/users/:userId/miners/bulk
+ * Cria **N** miners iguais (só muda o id). Opcionalmente podes usar padrões com {n}.
+ * Body:
+ * {
+ *   count: number (1..200),
+ *   values: { nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status, worker_name, api_key, secret_key, coin, pool, locked },
+ *   patterns?: { nomePattern?: "L9 #{n}", workerNamePattern?: "client001.{n}" } // substitui {n}
+ * }
+ */
+router.post("/users/:userId/miners/bulk", async (req, res) => {
+  if (!requireStaffOrAdmin(req, res)) return;
+  const user_id = String(req.params.userId || "");
+  if (!user_id) return res.status(400).json({ error: "userId em falta" });
+
+  const countRaw = req.body?.count;
+  const values = req.body?.values || {};
+  const patterns = req.body?.patterns || {};
+  const count = Number(countRaw);
+  if (!Number.isInteger(count) || count < 1 || count > 200) {
+    return res.status(400).json({ error: "count inválido (1..200)" });
+  }
+
+  try {
+    const nomeBase       = values?.nome ? String(values.nome).trim() : null;
+    const modeloBase     = values?.modelo ? String(values.modelo).trim() : null;
+    const hashRateNum    = normalizeDecimal(values?.hash_rate);
+    const precoKwNum     = normalizeDecimal(values?.preco_kw);
+    const consumoNum     = normalizeDecimal(values?.consumo_kw_hora);
+    const statusVal      = values?.status ? String(values.status).toLowerCase() : "offline";
+    const workerBase     = values?.worker_name ? String(values.worker_name).trim() : null;
+    const apiKeyBase     = values?.api_key ? String(values.api_key).trim() : null;
+    const secretKeyBase  = values?.secret_key ? String(values.secret_key).trim() : null;
+    const coinBase       = values?.coin ? String(values.coin).trim() : null;
+    const poolBase       = values?.pool ? String(values.pool).trim() : null;
+    const lockedVal      = typeof values?.locked === "boolean" ? values.locked : true;
+
+    const nomePattern = patterns?.nomePattern ? String(patterns.nomePattern) : null;
+    const workerPattern = patterns?.workerNamePattern ? String(patterns.workerNamePattern) : null;
+
+    // Faz o INSERT em massa via generate_series para eficiência
+    const inserted = await sql/*sql*/`
+      INSERT INTO miners (
+        user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
+        worker_name, api_key, secret_key, coin, pool, locked
+      )
+      SELECT
+        ${user_id} AS user_id,
+        ${nomePattern ? null : nomeBase}::text
+          || ${nomePattern ? "" : ""} AS nome,
+        ${modeloBase}::text AS modelo,
+        ${hashRateNum}::numeric AS hash_rate,
+        ${precoKwNum}::numeric AS preco_kw,
+        ${consumoNum}::numeric AS consumo_kw_hora,
+        ${statusVal}::text AS status,
+        ${workerPattern ? null : workerBase}::text AS worker_name,
+        ${apiKeyBase}::text AS api_key,
+        ${secretKeyBase}::text AS secret_key,
+        ${coinBase}::text AS coin,
+        ${poolBase}::text AS pool,
+        ${lockedVal}::boolean AS locked
+      FROM generate_series(1, ${count})
+      RETURNING id
+    `;
+
+    // Se usaste patterns, atualiza nome/worker_name já com {n} substituído (evita string-building no INSERT acima)
+    if (nomePattern || workerPattern) {
+      await sql/*sql*/`
+        WITH rows AS (
+          SELECT id, row_number() OVER (ORDER BY id) AS rn
+          FROM miners
+          WHERE user_id = ${user_id}
+          ORDER BY id DESC
+          LIMIT ${count}
+        )
+        UPDATE miners m
+        SET
+          nome = COALESCE(${nomePattern ? sql`REPLACE(${nomePattern}, '{n}', rows.rn::text)` : sql`m.nome`}, m.nome),
+          worker_name = COALESCE(${workerPattern ? sql`REPLACE(${workerPattern}, '{n}', rows.rn::text)` : sql`m.worker_name`}, m.worker_name)
+        FROM rows
+        WHERE m.id = rows.id
+      `;
+    }
+
+    invalidateUserList(user_id);
+    res.status(201).json({ ok: true, inserted: inserted.length });
+  } catch (e) {
+    error("POST /users/:userId/miners/bulk", e?.message || e);
+    res.status(500).json({ error: "Erro ao criar miners em massa" });
+  }
+});
+
+/**
+ * PATCH /api/staff/miners/:id
+ * Atualiza qualquer campo do miner (staff/admin).
+ */
+router.patch("/miners/:id", async (req, res) => {
+  if (!requireStaffOrAdmin(req, res)) return;
+  const id = parseIntIdOr400Param(req, res, "id");
+  if (id === null) return;
+
+  const {
+    user_id,
+    nome,
+    modelo,
+    hash_rate,
+    preco_kw,
+    consumo_kw_hora,
+    status,
+    worker_name,
+    api_key,
+    secret_key,
+    coin,
+    pool,
+    locked,
+    total_horas_online,
+  } = req.body || {};
+
+  try {
+    let hashRateNum, precoKwNum, consumoNum, hoursNum;
+    try {
+      if (hash_rate !== undefined) hashRateNum = normalizeDecimal(hash_rate);
+      if (preco_kw !== undefined)  precoKwNum  = normalizeDecimal(preco_kw);
+      if (consumo_kw_hora !== undefined) consumoNum = normalizeDecimal(consumo_kw_hora);
+      if (total_horas_online !== undefined) hoursNum = normalizeDecimal(total_horas_online);
+    } catch (e) {
+      return res.status(400).json({ error: String(e.message || e) });
+    }
+
+    const [updated] = await sql/*sql*/`
+      UPDATE miners
+      SET
+        user_id           = COALESCE(${user_id ?? null}, user_id),
+        nome              = COALESCE(${nome !== undefined ? String(nome).trim() : null}, nome),
+        modelo            = COALESCE(${modelo !== undefined ? String(modelo).trim() : null}, modelo),
+        hash_rate         = COALESCE(${hashRateNum ?? null}, hash_rate),
+        preco_kw          = COALESCE(${precoKwNum ?? null}, preco_kw),
+        consumo_kw_hora   = COALESCE(${consumoNum ?? null}, consumo_kw_hora),
+        status            = COALESCE(${status !== undefined ? String(status).toLowerCase() : null}, status),
+        worker_name       = COALESCE(${worker_name ?? null}, worker_name),
+        api_key           = COALESCE(${api_key ?? null}, api_key),
+        secret_key        = COALESCE(${secret_key ?? null}, secret_key),
+        coin              = COALESCE(${coin ?? null}, coin),
+        pool              = COALESCE(${pool ?? null}, pool),
+        locked            = COALESCE(${locked ?? null}, locked),
+        total_horas_online = COALESCE(${hoursNum ?? null}, total_horas_online),
+        updated_at        = NOW()
+      WHERE id = ${id}
+      RETURNING *
+    `;
+    if (!updated) return res.status(404).json({ error: "Miner não encontrada." });
+    if (updated?.user_id) invalidateUserList(String(updated.user_id));
+    res.json(updated);
+  } catch (e) {
+    error("PATCH /miners/:id", e?.message || e);
+    res.status(500).json({ error: "Erro ao atualizar miner" });
+  }
+});
+
+/**
+ * DELETE /api/staff/miners/:id
+ */
+router.delete("/miners/:id", async (req, res) => {
+  if (!requireStaffOrAdmin(req, res)) return;
+  const id = parseIntIdOr400Param(req, res, "id");
+  if (id === null) return;
+  try {
+    const [curr] = await sql/*sql*/`SELECT user_id FROM miners WHERE id = ${id} LIMIT 1`;
+    await sql/*sql*/`DELETE FROM miners WHERE id = ${id}`;
+    if (curr?.user_id) invalidateUserList(String(curr.user_id));
+    res.status(204).end();
+  } catch (e) {
+    error("DELETE /miners/:id", e?.message || e);
+    res.status(500).json({ error: "Erro ao apagar miner" });
   }
 });
 
@@ -92,7 +360,6 @@ router.get("/users/:userId/miners", async (req, res) => {
  */
 router.post("/miners/:id/status", async (req, res) => {
   if (!requireStaffOrAdmin(req, res)) return;
-
   const id = parseIntIdOr400Param(req, res, "id");
   if (id === null) return;
 
@@ -103,31 +370,27 @@ router.post("/miners/:id/status", async (req, res) => {
       return res.status(400).json({ error: "Status inválido (use 'online'|'offline'|'maintenance')." });
     }
   }
-
   try {
-    const [curr] = await sql/*sql*/`
-      SELECT id, user_id FROM miners WHERE id = ${id} LIMIT 1
-    `;
-    if (!curr) return res.status(404).json({ error: "Miner não encontrada." });
-
     const [updated] = await sql/*sql*/`
       UPDATE miners
       SET status = ${status}, updated_at = NOW()
       WHERE id = ${id}
-      RETURNING *;
+      RETURNING id, user_id, status
     `;
+    if (!updated) return res.status(404).json({ error: "Miner não encontrada." });
     if (updated?.user_id) invalidateUserList(String(updated.user_id));
-
     res.json(updated);
   } catch (e) {
-    console.error("[STAFF] POST /miners/:id/status ERROR:", e);
+    error("POST /miners/:id/status", e?.message || e);
     res.status(500).json({ error: "Erro ao atualizar status do miner" });
   }
 });
 
+/* ---------- INVOICES (por utilizador alvo) ---------- */
+
 /**
- * GET /api/staff/users/:userId/invoices?includeCurrent=1
- * Lista faturas fechadas + (opcional) cartão “em curso”.
+ * GET /api/staff/users/:userId/invoices
+ * ?includeCurrent=1 para inserir o “em_curso” no topo.
  */
 router.get("/users/:userId/invoices", async (req, res) => {
   if (!requireStaffOrAdmin(req, res)) return;
@@ -147,7 +410,6 @@ router.get("/users/:userId/invoices", async (req, res) => {
       WHERE user_id = ${userId}
       ORDER BY created_at DESC, id DESC
     `;
-
     const rows = saved.map(r => ({
       id: Number(r.id),
       year: Number(r.year),
@@ -160,13 +422,11 @@ router.get("/users/:userId/invoices", async (req, res) => {
 
     if (includeCurrent) {
       const { year, month } = currentYearMonth();
-
       const [currencyRow] = await sql/*sql*/`
         SELECT COALESCE(MAX(currency_code),'USD') AS currency_code
         FROM energy_invoices
         WHERE user_id = ${userId}
       `;
-
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -178,26 +438,15 @@ router.get("/users/:userId/invoices", async (req, res) => {
         WHERE user_id = ${userId}
         ORDER BY id ASC
       `;
-
       const items = miners.map(r => {
         const hours = Number(r.hours_online) || 0;
         const consumo = Number(r.consumo_kw_hora) || 0;
         const preco = Number(r.preco_kw) || 0;
         const kwh = +(hours * consumo).toFixed(3);
         const amount = +(kwh * preco).toFixed(2);
-        return {
-          miner_id: r.id,
-          miner_nome: String(r.miner_nome),
-          hours_online: hours,
-          kwh_used: kwh,
-          consumo_kw_hora: consumo,
-          preco_kw: preco,
-          amount_eur: amount,
-        };
+        return { amount_eur: amount };
       });
-
       const subtotal = +items.reduce((acc, it) => acc + Number(it.amount_eur || 0), 0).toFixed(2);
-
       rows.unshift({
         id: undefined,
         year,
@@ -211,16 +460,48 @@ router.get("/users/:userId/invoices", async (req, res) => {
 
     res.json(rows);
   } catch (e) {
-    console.error("[STAFF] GET /users/:userId/invoices ERROR:", e);
+    error("GET /users/:userId/invoices", e?.message || e);
     res.status(500).json({ error: "Erro ao listar faturas" });
   }
 });
 
 /**
+ * GET /api/staff/users/:userId/invoices/current/summary
+ * Snapshot rápido do mês corrente (kWh, horas, subtotal).
+ */
+router.get("/users/:userId/invoices/current/summary", async (req, res) => {
+  if (!requireStaffOrAdmin(req, res)) return;
+  const userId = String(req.params.userId || "");
+  if (!userId) return res.status(400).json({ error: "userId em falta" });
+
+  try {
+    const rows = await sql/*sql*/`
+      SELECT
+        COALESCE(SUM(total_horas_online),0)                        AS total_hours,
+        COALESCE(SUM(total_horas_online * COALESCE(consumo_kw_hora,0)),0) AS total_kwh,
+        COALESCE(SUM(
+          ROUND(total_horas_online * COALESCE(consumo_kw_hora,0), 3) * COALESCE(preco_kw,0)
+        ),0) AS subtotal_amount
+      FROM miners
+      WHERE user_id = ${userId}
+    `;
+    const r = rows[0] || {};
+    res.json({
+      total_hours: Number(r.total_hours || 0),
+      total_kwh: Number(r.total_kwh || 0),
+      subtotal_amount: Number(r.subtotal_amount || 0),
+    });
+  } catch (e) {
+    error("GET /users/:userId/invoices/current/summary", e?.message || e);
+    res.status(500).json({ error: "Erro ao calcular resumo atual" });
+  }
+});
+
+/**
  * GET /api/staff/users/:userId/invoices/detail
- *  - em curso:   ?current=1
- *  - por id:     ?invoiceId=123
- *  - por mês:    ?year=YYYY&month=M
+ * - em curso:   ?current=1
+ * - fechada:    ?invoiceId=123
+ * - retro:      ?year=YYYY&month=M (mais recente do mês)
  */
 router.get("/users/:userId/invoices/detail", async (req, res) => {
   if (!requireStaffOrAdmin(req, res)) return;
@@ -236,13 +517,11 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
   try {
     if (isCurrent) {
       const { year: y, month: m } = currentYearMonth();
-
       const [currencyRow] = await sql/*sql*/`
         SELECT COALESCE(MAX(currency_code),'USD') AS currency_code
         FROM energy_invoices
         WHERE user_id = ${userId}
       `;
-
       const miners = await sql/*sql*/`
         SELECT
           id,
@@ -260,18 +539,15 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
           LOWER(COALESCE(NULLIF(worker_name,''), nome, CONCAT('Miner#', id::text))),
           id ASC
       `;
-
       const items = miners.map(r => {
-        const hours = Number(r.hours_online) || 0;
+        const hours   = Number(r.hours_online) || 0;
         const consumo = Number(r.consumo_kw_hora) || 0;
-        const preco = Number(r.preco_kw) || 0;
-        const kwh = +(hours * consumo).toFixed(3);
-        const amount = +(kwh * preco).toFixed(2);
-
-        const worker = String(r.worker_name || "").trim() || null;
-        const modelo = String(r.modelo || "").trim() || null;
-        const hashRt = String(r.hash_rate || "").trim() || null;
-
+        const preco   = Number(r.preco_kw) || 0;
+        const kwh     = +(hours * consumo).toFixed(3);
+        const amount  = +(kwh * preco).toFixed(2);
+        const worker  = String(r.worker_name || "").trim() || null;
+        const modelo  = String(r.modelo || "").trim() || null;
+        const hashRt  = String(r.hash_rate || "").trim() || null;
         return {
           miner_id: r.id,
           miner_nome: String(r.miner_nome),
@@ -285,10 +561,8 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
           amount_eur: amount,
         };
       });
-
       const subtotal  = +items.reduce((acc, it) => acc + Number(it.amount_eur || 0), 0).toFixed(2);
       const total_kwh = +items.reduce((acc, it) => acc + Number(it.kwh_used  || 0), 0).toFixed(3);
-
       return res.json({
         header: {
           invoice_id: undefined,
@@ -355,7 +629,6 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
         LOWER(COALESCE(NULLIF(m.worker_name,''), eii.miner_nome)),
         eii.miner_id ASC
     `;
-
     const total_kwh = +items.reduce((acc, it) => acc + Number(it.kwh_used || 0), 0).toFixed(3);
 
     return res.json({
@@ -383,25 +656,22 @@ router.get("/users/:userId/invoices/detail", async (req, res) => {
       })),
     });
   } catch (e) {
-    console.error("[STAFF] GET /users/:userId/invoices/detail ERROR:", e);
+    error("GET /users/:userId/invoices/detail", e?.message || e);
     res.status(500).json({ error: "Erro ao obter fatura" });
   }
 });
 
 /**
  * POST /api/staff/users/:userId/invoices/close-now
- * Fecha fatura “em curso” do user (aplica mínimo).
+ * Fecha a fatura “em curso” do user (com mínimo).
  */
 router.post("/users/:userId/invoices/close-now", async (req, res) => {
   if (!requireStaffOrAdmin(req, res)) return;
-
   const userId = String(req.params.userId || "");
   if (!userId) return res.status(400).json({ error: "userId em falta" });
 
   const { year, month } = currentYearMonth();
-
   try {
-    // subtotal atual a partir dos miners
     const miners = await sql/*sql*/`
       SELECT
         id,
@@ -412,7 +682,6 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
       FROM miners
       WHERE user_id = ${userId}
     `;
-
     const subtotalCalc = miners.reduce((acc, r) => {
       const hours = Number(r.hours_online) || 0;
       const consumo = Number(r.consumo_kw_hora) || 0;
@@ -421,7 +690,6 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
       const amount = +(kwh * preco).toFixed(2);
       return acc + amount;
     }, 0);
-
     const subtotalRoundedCheck = Math.round(subtotalCalc * 100) / 100;
 
     const MIN_TOTAL = 15; // USD
@@ -433,7 +701,6 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
       });
     }
 
-    // cria fatura
     const insertedInv = await sql/*sql*/`
       INSERT INTO energy_invoices (user_id, year, month, subtotal_amount, status, currency_code)
       VALUES (${userId}, ${year}, ${month}, 0, 'pendente', 'USD')
@@ -441,7 +708,6 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
     `;
     const invoiceId = Number(insertedInv[0].id);
 
-    // snapshot -> items
     const insertedItems = await sql/*sql*/`
       INSERT INTO energy_invoice_items
         (invoice_id, miner_id, miner_nome, hours_online, kwh_used, preco_kw, consumo_kw_hora, amount_eur)
@@ -465,7 +731,6 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
     const subtotal = insertedItems.reduce((acc, r) => acc + Number(r.amount_eur || 0), 0);
     const subtotalRounded = Math.round(subtotal * 100) / 100;
 
-    // atualiza fatura
     await sql/*sql*/`
       UPDATE energy_invoices
       SET subtotal_amount = ${subtotalRounded}::numeric,
@@ -473,32 +738,15 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
           status = 'pendente'
       WHERE id = ${invoiceId}
     `;
+    await sql/*sql*/`UPDATE miners SET total_horas_online = 0 WHERE user_id = ${userId}`;
 
-    // reset horas
-    await sql/*sql*/`
-      UPDATE miners
-      SET total_horas_online = 0
-      WHERE user_id = ${userId}
-    `;
-
-    // invalida listas do user (miners e invoices consomem cache por user)
     invalidateUserList(userId);
-
     return res.json({
       ok: true,
-      invoice: {
-        id: invoiceId,
-        year,
-        month,
-        status: "pendente",
-        items_count: itemsCount,
-        subtotal_amount: subtotalRounded,
-      },
+      invoice: { id: invoiceId, year, month, status: "pendente", items_count: itemsCount, subtotal_amount: subtotalRounded },
     });
   } catch (e) {
-    console.error("[STAFF] POST /users/:userId/invoices/close-now ERROR:", {
-      code: e?.code, detail: e?.detail, message: e?.message,
-    });
+    error("POST /users/:userId/invoices/close-now", { code: e?.code, detail: e?.detail, message: e?.message });
     return res.status(500).json({ error: e?.detail || e?.message || "Erro ao fechar fatura" });
   }
 });
@@ -508,7 +756,6 @@ router.post("/users/:userId/invoices/close-now", async (req, res) => {
  */
 router.get("/invoices/status", async (req, res) => {
   if (!requireStaffOrAdmin(req, res)) return;
-
   const invoiceId = Number(req.query.invoiceId);
   if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
 
@@ -520,17 +767,12 @@ router.get("/invoices/status", async (req, res) => {
       LIMIT 1
     `;
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
-
     res.json({
       ok: true,
-      invoice: {
-        id: Number(inv.id),
-        status: String(inv.status),
-        subtotal_amount: Number(inv.subtotal_amount),
-      },
+      invoice: { id: Number(inv.id), status: String(inv.status), subtotal_amount: Number(inv.subtotal_amount) },
     });
   } catch (e) {
-    console.error("[STAFF] GET /invoices/status ERROR:", e);
+    error("GET /invoices/status", e?.message || e);
     res.status(500).json({ error: "Erro ao consultar estado da fatura" });
   }
 });
