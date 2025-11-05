@@ -47,7 +47,7 @@ function normalizeDecimal(input) {
 }
 
 const ALLOWED_STATUS = new Set(["online", "offline", "maintenance"]);
-const ALLOWED_POOLS  = new Set(["ViaBTC", "LiteCoinPool"]);
+const ALLOWED_POOLS  = new Set(["ViaBTC", "LiteCoinPool","F2Pool","Binance","MiningDutch"]);
 
 function ensureStatus(val) {
   if (val === undefined || val === null || val === "") return null;
