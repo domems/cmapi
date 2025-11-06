@@ -182,43 +182,54 @@ function verifyNowPayments(req, res, next) {
 /**
  * Caminho do webhook: /api/payments/nowpayments
  * MONTA isto cedo no server:
- *   app.post("/api/payments/nowpayments", bodyParser.raw({ type: "application/json", limit: "512kb" }), npLimiter, verifyNowPayments, (req,res,next)=>{ req.url="/payments/nowpayments"; next(); }, paymentsRoutes);
+ *   app.post("/api/payments/nowpayments",
+ *     bodyParser.raw({ type: "application/json", limit: "512kb" }),
+ *     npLimiter,
+ *     verifyNowPayments,
+ *     (req,res,next)=>{ req.url="/payments/nowpayments"; next(); },
+ *     paymentsRoutes);
  */
-webhookRouter.post("/payments/nowpayments", bodyParser.raw({ type: "application/json" }), npLimiter, verifyNowPayments, async (req, res) => {
-  try {
-    const evt = req.ipn;
-    const externalId = String(evt?.payment_id || evt?.invoice_id || evt?.ipn_id || "").trim();
-    if (!externalId) return res.status(400).send("Missing external id");
+webhookRouter.post(
+  "/payments/nowpayments",
+  bodyParser.raw({ type: "application/json" }),
+  npLimiter,
+  verifyNowPayments,
+  async (req, res) => {
+    try {
+      const evt = req.ipn;
+      const externalId = String(evt?.payment_id || evt?.invoice_id || evt?.ipn_id || "").trim();
+      if (!externalId) return res.status(400).send("Missing external id");
 
-    // log bruto idempotente
-    await sql/*sql*/`
-      INSERT INTO payments_ipn (provider, external_id, payload)
-      VALUES ('nowpayments', ${externalId}, ${sql.json(evt)})
-      ON CONFLICT (external_id) DO NOTHING;
-    `;
+      // log bruto idempotente
+      await sql/*sql*/`
+        INSERT INTO payments_ipn (provider, external_id, payload)
+        VALUES ('nowpayments', ${externalId}, ${sql.json(evt)})
+        ON CONFLICT (external_id) DO NOTHING;
+      `;
 
-    // Reconciliação segura
-    const orderId = String(evt?.order_id || "");
-    const invoiceId = orderId.startsWith("invoice_") ? Number(orderId.replace("invoice_", "")) : null;
-    if (!invoiceId) return res.status(200).send("ok");
+      // Reconciliação segura
+      const orderId = String(evt?.order_id || "");
+      const invoiceId = orderId.startsWith("invoice_") ? Number(orderId.replace("invoice_", "")) : null;
+      if (!invoiceId) return res.status(200).send("ok");
 
-    const paymentStatus = normalizeProviderStatus(evt.payment_status);
-    // Atualizações mínimas idempotentes
-    if (EXTRA_COLS.provider_status)
-      await sql/*sql*/`UPDATE energy_invoices SET provider_status=${paymentStatus} WHERE id=${invoiceId}`;
-    if (paymentStatus === "finished")
-      await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
-    else if (paymentStatus === "partially_paid")
-      await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
-    else if (["failed","expired"].includes(paymentStatus))
-      await sql/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
+      const paymentStatus = normalizeProviderStatus(evt.payment_status);
+      // Atualizações mínimas idempotentes
+      if (EXTRA_COLS.provider_status)
+        await sql/*sql*/`UPDATE energy_invoices SET provider_status=${paymentStatus} WHERE id=${invoiceId}`;
+      if (paymentStatus === "finished")
+        await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
+      else if (paymentStatus === "partially_paid")
+        await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
+      else if (["failed","expired"].includes(paymentStatus))
+        await sql/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
 
-    return res.status(200).send("ok");
-  } catch (err) {
-    console.error("NOWPayments webhook error:", err);
-    return res.status(500).send("error");
+      return res.status(200).send("ok");
+    } catch (err) {
+      console.error("NOWPayments webhook error:", err);
+      return res.status(500).send("error");
+    }
   }
-});
+);
 
 /* =======================================
    ROUTER PRINCIPAL (monta depois do JSON)
@@ -284,7 +295,7 @@ router.post("/payments/create-intent", async (req, res) => {
     // 5) Cria pagamento no PSP
     const price_amount = money2Number(inv.subtotal_amount);
     const payload = {
-      price_amount,
+      price_amount,                         // SEMPRE 2 casas
       price_currency: "USD",
       pay_currency,
       order_id: `invoice_${inv.id}`,
@@ -340,7 +351,7 @@ router.post("/payments/create-intent", async (req, res) => {
         network: net,
         provider_currency: pay_currency,
         amount_fiat: price_amount,                 // 2 casas
-        amount_crypto: np.pay_amount || null,      // vem do PSP (não forças casas)
+        amount_crypto: np.pay_amount || null,      // crypto vem do PSP (não forças casas)
         payment_address: np.pay_address || null,
         pay_url: np.invoice_url || null,
         status: "pending",
@@ -426,6 +437,28 @@ async function syncHandler(req, res) {
 router.post("/payments/sync", syncHandler);
 router.get("/payments/sync", syncHandler);
 
+/** Status (GET) — usado no fallback do frontend */
+router.get("/payments/status", async (req, res) => {
+  try {
+    const invoiceId = Number(req.query.invoiceId);
+    if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
+    const inv = await invoiceById(invoiceId);
+    if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
+
+    const payload = {
+      id: inv.id,
+      status: inv.status,
+      provider_status: EXTRA_COLS.provider_status ? inv.provider_status ?? null : null,
+      amount_fiat: money2Number(inv.subtotal_amount),
+      amount_crypto: inv.pay_amount,
+    };
+    return res.json(payload);
+  } catch (err) {
+    console.error("status:", err);
+    return res.status(500).json({ error: "Erro interno" });
+  }
+});
+
 /** QR code (public) */
 router.get("/payments/qr", async (req, res) => {
   try {
@@ -442,7 +475,7 @@ router.get("/payments/qr", async (req, res) => {
       const amt = amount ? String(amount) : "";
       uri = `litecoin:${address}${amt ? `?amount=${amt}` : ""}`;
     } else if (c === "USDC") {
-      // Força 2 casas para USDC no valor que devolves (não há URI padrão com amount)
+      // estáveis não têm URI universal — QR é só o address
       uri = `${address}`;
     } else {
       uri = String(address);
