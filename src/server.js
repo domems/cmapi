@@ -1,3 +1,4 @@
+// src/server.js
 import express from "express";
 import dotenv from "dotenv";
 import helmet from "helmet";
@@ -15,6 +16,7 @@ import { listarMinersPorUser } from "./controllers/minersController.js";
 import { sql } from "./config/db.js";
 import { startAllJobs } from "./jobs/index.js";
 
+/* ===== Rotas ===== */
 import minerRoutes from "./routes/minersRoutes.js";
 import clerkRoutes from "./routes/clerkRoutes.js";
 import statusRoutes from "./routes/statusRoutes.js";
@@ -27,6 +29,7 @@ import notificationsRouter from "./routes/notifications.js";
 import pushRouter from "./routes/push.js";
 import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
+import staffRouter from "./routes/staff.js"; // <-- isto faltava/estava errado no teu deploy
 
 dotenv.config();
 
@@ -38,7 +41,7 @@ const ORIGINS = (process.env.CORS_ORIGINS || "")
 
 const app = express();
 
-/* ===== Segurança & CORS ===== */
+/* ================= Segurança base ================= */
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
 
@@ -54,6 +57,7 @@ app.use(
 app.use(
   cors({
     origin(origin, cb) {
+      // apps nativas (sem Origin) e origens whitelisted
       if (!origin || ORIGINS.includes(origin)) return cb(null, true);
       return cb(new Error("CORS origin not allowed"));
     },
@@ -64,7 +68,7 @@ app.use(
   })
 );
 
-/* ===== Logger ===== */
+/* ================= Logger (pino) ================= */
 const logger = pino({
   level: process.env.LOG_LEVEL || "warn",
   redact: [
@@ -95,28 +99,31 @@ app.use(
 );
 
 /* =========================================================
-   WEBHOOK NOWPAYMENTS — RAW body ANTES de Clerk/JSON
+   WEBHOOK NOWPayments — RAW body ANTES de Clerk/JSON
    Caminho público: POST /api/payments/nowpayments
    ========================================================= */
 app.post(
   "/api/payments/nowpayments",
-  // RAW para o HMAC; aceita application/json e application/*+json
+  // RAW para o HMAC (aceita application/json e application/*+json)
   express.raw({ type: ["application/json", "application/*+json"], limit: "512kb" }),
-  paymentsWebhookRouter // o router já verifica HMAC e trata a IPN
+  paymentsWebhookRouter // o router de payments valida HMAC e trata o IPN
 );
 
-/* ===== Clerk + parsers (DEPOIS do webhook) ===== */
+/* ================= Clerk e body parsers (depois do webhook) ================= */
 app.use(clerkMiddleware());
 app.use(express.json({ limit: "200kb" }));
 app.use(express.urlencoded({ extended: false, limit: "200kb" }));
 
-/* ===== Rate-limit específico (listagem) ===== */
+/* ================= Rate-limit específico: lista de miners ================= */
 const minersListLimiter = rateLimit({
   windowMs: 60_000,
   limit: 60,
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => (req.auth?.userId ? `uid:${req.auth.userId}` : ipKeyGenerator(req)),
+  keyGenerator: (req) => {
+    if (req.auth?.userId) return `uid:${req.auth.userId}`;
+    return ipKeyGenerator(req);
+  },
   handler: (_req, res) => {
     res.setHeader("Retry-After", "60");
     res.status(429).json({ message: "Too many requests, please try again later :)" });
@@ -124,13 +131,14 @@ const minersListLimiter = rateLimit({
   skip: (req) => req.method === "OPTIONS" || req.method === "HEAD",
 });
 
-/* ===== Rotas antes do limiter global ===== */
+/* ================= Rotas especiais ANTES do limiter global ================= */
 app.get(
   "/api/miners/user/:userId",
   requireAuth(),
   preListCache(),
   minersListLimiter,
   (req, res, next) => {
+    // bloqueio cross-tenant
     const param = String(req.params.userId);
     const uid = req.auth?.userId;
     if (!uid || uid !== param) return res.status(403).json({ error: "Forbidden" });
@@ -138,15 +146,16 @@ app.get(
   }
 );
 
-/* ===== Limiter global e rotas ===== */
+/* ================= Middlewares/rotas do resto da app ================= */
+// Limiter global
 app.use(rateLimiter);
 
-// públicas
+// públicas/gerais
 app.use("/api/clerk", clerkRoutes);
 app.use("/api", statusRoutes);
 app.use("/api", storeMinersRoutes);
 
-// payments API (create-intent, intent, sync, qr)
+// Payments normal (create-intent, intent, sync, qr)
 app.use("/api", paymentsRoutes);
 
 // rotas com auth do utilizador
@@ -162,36 +171,44 @@ app.use("/api", requireAuth(), userScope, notificationsRouter);
 app.use("/api", requireAuth(), userScope, pushRouter);
 app.use("/api", requireAuth(), userScope, prefsRouter);
 
-// auth/bootstrap
+// auth bootstrap
 app.use("/api/auth", authRouter);
 
-// admin/staff
+// rotas ADMIN (sessão + role na Clerk)
 app.use("/api/admin", requireAuth(), adminOrStaffOnly, minersAdminRoutes);
 app.use("/api/admin", requireAuth(), adminOrStaffOnly, adminInvoicesRouter);
+
+// rotas STAFF (sessão + role)
 app.use("/api/staff", requireAuth(), staffOrAdmin(), staffRouter);
 
-// health
+/* ================= Raiz/health ================= */
 app.get("/", (_req, res) => {
   res.setHeader("Cache-Control", "public, max-age=0, s-maxage=300, stale-while-revalidate=60");
   return res.status(204).end();
 });
 app.get("/api/healthz", (_req, res) => res.json({ ok: true }));
 
-/* ===== 404 + Error handler ===== */
+/* ================= 404 e Error handler ================= */
 app.use((req, res) => res.status(404).json({ error: "Not found" }));
 app.use((err, req, res, _next) => {
   const status = err?.status && Number.isInteger(err.status) ? err.status : 500;
   req.log?.error({ err }, "Unhandled error");
-  res.status(status).json({ error: status === 500 ? "Internal error" : String(err.message || "Error") });
+  res
+    .status(status)
+    .json({ error: status === 500 ? "Internal error" : String(err.message || "Error") });
 });
 
-/* ===== DB bootstrap ===== */
+/* ================= DB bootstrap ================= */
 async function initDB() {
   try {
-    try { await sql/*sql*/`CREATE EXTENSION IF NOT EXISTS pgcrypto;`; } catch (e) {
+    // pgcrypto (melhor esforço)
+    try {
+      await sql/*sql*/`CREATE EXTENSION IF NOT EXISTS pgcrypto;`;
+    } catch (e) {
       console.warn("⚠️ pgcrypto skipped:", e?.message || e);
     }
 
+    // tabela de IPNs (se não existir)
     await sql/*sql*/`
       CREATE TABLE IF NOT EXISTS payments_ipn (
         id BIGSERIAL PRIMARY KEY,
@@ -201,7 +218,8 @@ async function initDB() {
         received_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `;
-    // (as tuas outras tabelas já existentes...)
+
+    // (se quiseres, cria aqui índices adicionais ou outras tabelas)
     logger.info("✅ DB pronta.");
   } catch (err) {
     console.error("❌ Erro ao preparar a DB:", err);
@@ -209,12 +227,14 @@ async function initDB() {
   }
 }
 
-/* ===== Arranque ===== */
+/* ================= Arranque ================= */
 initDB().then(() => {
   const server = app.listen(PORT, () => {
     logger.info(`HTTP listening on :${PORT}`);
     startAllJobs();
   });
+
+  // timeouts para travar slowloris
   server.headersTimeout = 65_000;
   server.requestTimeout = 60_000;
 });
