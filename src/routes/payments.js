@@ -6,39 +6,35 @@ import crypto from "crypto";
 import QRCode from "qrcode";
 import { sql } from "../config/db.js";
 
-/* ================== ENV & CONSTANTS ================== */
+/* ================== ENV ================== */
 const NOW_API_KEY    = process.env.NOWPAYMENTS_API_KEY || "";
 const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || "";
-const NOW_IPN_URL    = process.env.NOWPAYMENTS_WEBHOOK_URL || ""; // opcional
+const NOW_IPN_URL    = process.env.NOWPAYMENTS_WEBHOOK_URL || "";
 const NOW_API        = "https://api.nowpayments.io/v1";
 
-if (!NOW_API_KEY) console.error("[payments] NOWPAYMENTS_API_KEY missing — create-intent vai falhar.");
+if (!NOW_API_KEY) console.error("[payments] NOWPAYMENTS_API_KEY missing");
 
+/* ================== CONSTS ================== */
 const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
 const USDC_NETWORKS = ["ERC20", "BEP20"];
 const CURR_TTL_MS = 15 * 60 * 1000;
 let _currCache = { list: null, ts: 0 };
 
-/* ================== MONEY (centavos, round half-up) ================== */
-function toCentsStrict(v) {
+/* ================== MONEY (centavos) ================== */
+const toCents = (v) => {
   if (v == null) return 0;
   const n = Number(String(v).replace(",", "."));
   if (!isFinite(n)) return 0;
-  return Math.round(n * 100);
-}
-function centsToNumber(cents) {
-  return Number((Number(cents || 0) / 100).toFixed(2));
-}
-function normalizeMoney2(v) {
-  return centsToNumber(toCentsStrict(v));
-}
+  return Math.round(n * 100); // round half-up
+};
+const centsTo2 = (c) => Number((Number(c || 0) / 100).toFixed(2));
+const money2 = (v) => centsTo2(toCents(v)); // normaliza para 2 casas
 
-/* ================== DB HELPERS ================== */
+/* ================== DB ================== */
 async function invoiceById(id) {
   const [row] = await sql/*sql*/`
     SELECT id, user_id, year, month,
-           subtotal_amount, total_amount,
-           status, currency_code,
+           subtotal_amount, status, currency_code,
            provider_payment_id, provider_currency,
            pay_network, pay_address, pay_amount, pay_url
     FROM energy_invoices
@@ -64,7 +60,7 @@ async function txRun(fn) {
   }
 }
 
-/* ================== OPTIONAL COLUMNS ================== */
+/* ================== OPTIONAL COLS ================== */
 const EXTRA_COLS = {
   provider_status: false,
   provider_paid_amount: false,
@@ -80,13 +76,13 @@ const EXTRA_COLS = {
     const names = new Set(cols.map(c => c.column_name));
     for (const k of Object.keys(EXTRA_COLS)) EXTRA_COLS[k] = names.has(k);
   } catch (e) {
-    console.warn("[payments] optional columns detection failed:", e?.message || e);
+    console.warn("[payments] optional cols detection failed:", e?.message || e);
   }
 })();
 
 /* ================== PSP HELPERS ================== */
 async function getNowCurrenciesCached() {
-  if (!NOW_API_KEY) throw new Error("PSP not configured: NOWPAYMENTS_API_KEY missing");
+  if (!NOW_API_KEY) throw new Error("PSP not configured");
   const now = Date.now();
   if (_currCache.list && now - _currCache.ts < CURR_TTL_MS) return _currCache.list;
   const r = await fetch(`${NOW_API}/currencies`, { headers: { "x-api-key": NOW_API_KEY } });
@@ -94,9 +90,9 @@ async function getNowCurrenciesCached() {
   let data; try { data = JSON.parse(raw); } catch { data = raw; }
   if (!r.ok) {
     const msg = (data && (data.message || data.error)) ? (data.message || data.error) : raw;
-    throw new Error(`NOWPayments /currencies HTTP ${r.status}: ${msg}`);
+    throw new Error(`NOW /currencies ${r.status}: ${msg}`);
   }
-  let list = Array.isArray(data) ? data : (data.currencies || data.supported_currencies || []);
+  const list = Array.isArray(data) ? data : (data.currencies || data.supported_currencies || []);
   _currCache = { list: list.map(s => String(s).toUpperCase()), ts: now };
   return _currCache.list;
 }
@@ -109,20 +105,20 @@ async function mapPayCurrency(currency, network) {
   if (c === "USDC") {
     if (!USDC_NETWORKS.includes(n)) throw new Error("Rede inválida para USDC");
     if (n === "ERC20") {
-      if (!list.includes("USDC")) throw new Error("USDC(ERC20) indisponível no PSP");
+      if (!list.includes("USDC")) throw new Error("USDC(ERC20) indisponível");
       return "USDC";
     }
     if (n === "BEP20") {
-      if (!list.includes("USDCBSC")) throw new Error("USDC(BEP20) indisponível no PSP");
+      if (!list.includes("USDCBSC")) throw new Error("USDC(BEP20) indisponível");
       return "USDCBSC";
     }
   }
   if (c === "BTC") {
-    if (!list.includes("BTC")) throw new Error("BTC indisponível no PSP");
+    if (!list.includes("BTC")) throw new Error("BTC indisponível");
     return "BTC";
   }
   if (c === "LTC") {
-    if (!list.includes("LTC")) throw new Error("LTC indisponível no PSP");
+    if (!list.includes("LTC")) throw new Error("LTC indisponível");
     return "LTC";
   }
   throw new Error("Moeda não suportada");
@@ -140,16 +136,11 @@ const getAuthContext = (req) => {
 };
 
 /* ===========================================================
-   WEBHOOK ROUTER (monta ANTES do express.json() no server.js)
+   WEBHOOK (monta ANTES do express.json() no server)
    =========================================================== */
 export const webhookRouter = express.Router();
 
-const npLimiter = rateLimit({
-  windowMs: 60_000,
-  limit: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const npLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
 
 function verifyNowPayments(req, res, next) {
   try {
@@ -161,16 +152,14 @@ function verifyNowPayments(req, res, next) {
     const hmac = crypto.createHmac("sha512", NOW_IPN_SECRET).update(payloadBuf).digest("hex");
     const a = Buffer.from(hmac.toLowerCase(), "utf8");
     const b = Buffer.from(String(sigHeader).toLowerCase(), "utf8");
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-      return res.status(401).send("Invalid signature");
-    }
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).send("Invalid signature");
 
     let parsed;
     try { parsed = JSON.parse(payloadBuf.toString("utf8")); }
     catch { return res.status(400).send("Invalid JSON"); }
     req.ipn = parsed;
     next();
-  } catch (_e) {
+  } catch {
     return res.status(400).send("Invalid webhook");
   }
 }
@@ -196,14 +185,15 @@ webhookRouter.post(
       const invoiceId = orderId.startsWith("invoice_") ? Number(orderId.replace("invoice_", "")) : null;
       if (!invoiceId) return res.status(200).send("ok");
 
-      const paymentStatus = normalizeProviderStatus(evt.payment_status);
+      const st = normalizeProviderStatus(evt.payment_status);
+
       if (EXTRA_COLS.provider_status)
-        await sql/*sql*/`UPDATE energy_invoices SET provider_status=${paymentStatus} WHERE id=${invoiceId}`;
-      if (paymentStatus === "finished")
+        await sql/*sql*/`UPDATE energy_invoices SET provider_status=${st} WHERE id=${invoiceId}`;
+      if (st === "finished")
         await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
-      else if (paymentStatus === "partially_paid")
+      else if (st === "partially_paid")
         await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
-      else if (["failed","expired"].includes(paymentStatus))
+      else if (["failed","expired"].includes(st))
         await sql/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
 
       return res.status(200).send("ok");
@@ -215,11 +205,11 @@ webhookRouter.post(
 );
 
 /* =======================================
-   ROUTER PRINCIPAL (monta depois do JSON)
+   ROUTER PRINCIPAL (depois do express.json)
    ======================================= */
 const router = express.Router();
 
-/** Create intent (idempotente, valores em 2 casas) */
+/** Create intent (idempotente; usa SEMPRE subtotal_amount em 2 casas) */
 router.post("/payments/create-intent", async (req, res) => {
   const { userId, isAdmin } = getAuthContext(req);
   try {
@@ -233,15 +223,14 @@ router.post("/payments/create-intent", async (req, res) => {
 
     let net = String(network || "").toUpperCase();
     if (cur === "USDC" && !USDC_NETWORKS.includes(net)) return res.status(400).json({ error: "Rede inválida para USDC" });
-    if (cur !== "USDC") net = "NATIVE"; // BTC/LTC
+    if (cur !== "USDC") net = "NATIVE";
 
-    // 1) Lê a fatura e autoriza
     const inv = await invoiceById(Number(invoiceId));
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
     if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
     if (inv.status === "pago") return res.status(409).json({ error: "Fatura já paga" });
 
-    // 2) Idempotência: reuse intent ativo
+    // Reusar intent ativo
     if (inv.provider_payment_id && inv.status === "aguarda_pagamento") {
       return res.json({
         ok: true,
@@ -250,7 +239,7 @@ router.post("/payments/create-intent", async (req, res) => {
           currency: cur,
           network: inv.pay_network || net,
           provider_currency: inv.provider_currency || null,
-          amount_fiat: normalizeMoney2(inv.total_amount ?? inv.subtotal_amount),
+          amount_fiat: money2(inv.subtotal_amount),
           amount_crypto: inv.pay_amount,
           payment_address: inv.pay_address,
           pay_url: inv.pay_url,
@@ -259,16 +248,15 @@ router.post("/payments/create-intent", async (req, res) => {
       });
     }
 
-    // 3) Mapeia moeda+rede
+    // Mapeia moeda+rede
     let pay_currency;
     try {
       pay_currency = await mapPayCurrency(cur, net);
-    } catch (mapErr) {
-      console.warn("[payments] mapPayCurrency failed:", { cur, net, msg: String(mapErr?.message || mapErr) });
-      return res.status(400).json({ error: String(mapErr?.message || mapErr) });
+    } catch (e) {
+      return res.status(400).json({ error: String(e?.message || e) });
     }
 
-    // 4) Determina IPN URL — .env ou fallback
+    // IPN URL
     let ipnUrl = NOW_IPN_URL;
     if (!ipnUrl) {
       const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
@@ -276,11 +264,10 @@ router.post("/payments/create-intent", async (req, res) => {
       ipnUrl = `${proto}://${host}/api/payments/nowpayments`;
     }
 
-    // 5) Montante FIAT a cobrar (sempre 2 casas)
-    const price_cents = toCentsStrict(inv.total_amount ?? inv.subtotal_amount);
-    const price_amount = centsToNumber(price_cents);
+    // Montante a cobrar
+    const price_amount = money2(inv.subtotal_amount); // 2 casas, sem drift
 
-    // 6) Chamada ao PSP
+    // Chamada PSP
     const payload = {
       price_amount,
       price_currency: "USD",
@@ -300,14 +287,16 @@ router.post("/payments/create-intent", async (req, res) => {
       raw = await npRes.text();
       try { np = JSON.parse(raw); } catch { np = raw; }
       if (!npRes.ok || !np?.payment_id) {
-        const msg = (np && (np.message || np.error || np.errors)) ? (np.message || np.error || JSON.stringify(np.errors)) : raw;
+        const msg = (np && (np.message || np.error || np.errors))
+          ? (np.message || np.error || JSON.stringify(np.errors))
+          : raw;
         return res.status(502).json({ error: "Erro PSP", provider_error: msg });
       }
     } catch (e) {
       return res.status(502).json({ error: "Erro PSP (network)", detail: String(e?.message || e) });
     }
 
-    // 7) UPDATE (tx) — normaliza subtotal_amount para 2 casas (higiene)
+    // Persistir provider data
     await txRun(async () => {
       await sql/*sql*/`
         UPDATE energy_invoices
@@ -318,7 +307,6 @@ router.post("/payments/create-intent", async (req, res) => {
             pay_address=${np.pay_address || null},
             pay_amount=${np.pay_amount || null},
             pay_url=${np.invoice_url || null},
-            subtotal_amount=${price_amount},
             updated_at=NOW()
         WHERE id=${inv.id}
       `;
@@ -372,7 +360,7 @@ router.get("/payments/intent", async (req, res) => {
         network: inv.pay_network,
         payment_address: inv.pay_address,
         amount_crypto: inv.pay_amount,
-        amount_fiat: normalizeMoney2(inv.total_amount ?? inv.subtotal_amount),
+        amount_fiat: money2(inv.subtotal_amount),
         pay_url: inv.pay_url,
       },
     });
@@ -382,7 +370,7 @@ router.get("/payments/intent", async (req, res) => {
   }
 });
 
-/** Sync (GET or POST) */
+/** Sync (GET/POST) */
 async function syncHandler(req, res) {
   const { userId, isAdmin } = getAuthContext(req);
   try {
@@ -394,9 +382,7 @@ async function syncHandler(req, res) {
     if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
     if (!inv.provider_payment_id) return res.status(400).json({ error: "sem provider_payment_id" });
 
-    const r = await fetch(`${NOW_API}/payment/${inv.provider_payment_id}`, {
-      headers: { "x-api-key": NOW_API_KEY },
-    });
+    const r = await fetch(`${NOW_API}/payment/${inv.provider_payment_id}`, { headers: { "x-api-key": NOW_API_KEY } });
     const p = await r.json().catch(() => ({}));
     if (!r.ok) {
       const msg = p?.message || p?.error || JSON.stringify(p || {});
@@ -425,7 +411,7 @@ async function syncHandler(req, res) {
 router.post("/payments/sync", syncHandler);
 router.get("/payments/sync", syncHandler);
 
-/** Status (GET) — fallback do frontend */
+/** Status */
 router.get("/payments/status", async (req, res) => {
   try {
     const invoiceId = Number(req.query.invoiceId);
@@ -437,7 +423,7 @@ router.get("/payments/status", async (req, res) => {
       id: inv.id,
       status: inv.status,
       provider_status: EXTRA_COLS.provider_status ? inv.provider_status ?? null : null,
-      amount_fiat: normalizeMoney2(inv.total_amount ?? inv.subtotal_amount),
+      amount_fiat: money2(inv.subtotal_amount),
       amount_crypto: inv.pay_amount,
     });
   } catch (err) {
@@ -470,8 +456,7 @@ router.get("/payments/qr", async (req, res) => {
     const qr = await QRCode.toDataURL(uri, { margin: 1, width: 300 });
 
     if (c === "USDC") {
-      // devolve amount normalizado para a UI
-      const amtStr = amount != null ? centsToNumber(toCentsStrict(amount)).toFixed(2) : null;
+      const amtStr = amount != null ? money2(amount).toFixed(2) : null;
       return res.json({ ok: true, qr, amount: amtStr });
     }
 
