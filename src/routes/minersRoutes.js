@@ -1,12 +1,9 @@
 import express from "express";
 import {
   listarMinersPorUser,
-  atualizarStatusMiner,
   atualizarMinerComoCliente,
-  atualizarMinerComoAdmin,
-  apagarMiner,
   obterMinerPorId,
-  criarMiner,
+  getMinerStateHistory,
 } from "../controllers/minersController.js";
 
 const router = express.Router();
@@ -26,5 +23,6 @@ router.get("/user/:userId", listarMinersPorUser);
 // ler por id
 router.get("/:id", obterMinerPorId);
 
+router.get("/miners/:id/state-history", requireAuth(), getMinerStateHistory);
 
 export default router;

@@ -42,6 +42,48 @@ function parseIntIdOr400(req, res) {
   return num;
 }
 
+const TAG = "[MINER-STATE-HISTORY]";
+const ALLOWED_STATES = new Set(["ONLINE","OFFLINE","MAINTENANCE","STALE"]);
+
+export async function getMinerStateHistory(req, res) {
+  try {
+    const minerId = Number(req.params.id);
+    const limit = Math.min(Number(req.query.limit || 50), 200);
+
+    if (!Number.isInteger(minerId)) {
+      return res.status(400).json({ error: "invalid miner id" });
+    }
+
+    // (Opcional) validar que o miner pertence ao utilizador autenticado
+    // Se já tens middleware/guard, mantém. Se não, valida aqui.
+    // const userId = req.auth.userId; ... SELECT owner_user_id FROM miners WHERE id=$1
+
+    const rows = await sql/*sql*/`
+      SELECT
+        id,
+        miner_id,
+        from_state,
+        to_state,
+        slot_iso,
+        occurred_at_utc,
+        reason
+      FROM miner_state_events
+      WHERE miner_id = ${minerId}
+      ORDER BY occurred_at_utc DESC
+      LIMIT ${limit};
+    `;
+
+    // sanity: filtra estados inválidos se alguém meteu porcaria
+    const safe = rows.filter(r => ALLOWED_STATES.has(r.from_state) && ALLOWED_STATES.has(r.to_state));
+
+    res.json({ items: safe });
+  } catch (e) {
+    try { console.error(TAG, e); } catch {}
+    res.status(500).json({ error: "failed to fetch miner state history" });
+  }
+}
+
+
 /* ===================== Criar ===================== */
 export const criarMiner = async (req, res) => {
   const {
