@@ -21,16 +21,17 @@ import clerkRoutes from "./routes/clerkRoutes.js";
 import statusRoutes from "./routes/statusRoutes.js";
 import storeMinersRoutes from "./routes/storeMinersRoutes.js";
 import invoicesRoutes from "./routes/invoices.js";
-import paymentsRoutes from "./routes/payments.js";
+// ⬇️ Usa o router único de payments que também exporta o webhookRouter
+import paymentsRoutes, { webhookRouter as paymentsWebhookRouter } from "./routes/payments.js";
 import minersAdminRoutes from "./routes/minersAdminRoutes.js";
 import adminInvoicesRouter from "./routes/adminInvoicesRouter.js";
 import notificationsRouter from "./routes/notifications.js";
 import pushRouter from "./routes/push.js";
 import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
-import paymentsWebhookRouter from "./routes/paymentsWebhook.js";
 
-import { adminOnly } from "./middleware/adminOnly.js";
+// ❌ REMOVE: router antigo e duplicado de webhook
+// import paymentsWebhookRouter from "./routes/paymentsWebhook.js";
 
 dotenv.config();
 
@@ -101,14 +102,24 @@ app.use(
   })
 );
 
-/* ================= Clerk e body parsers ================= */
-app.use(clerkMiddleware());
-
-// Webhook NOWPayments: precisa de raw body (ANTES do json)
-app.use(
-  "/api/payments/webhook/nowpayments",
-  express.raw({ type: "*/*", limit: "256kb" })
+/* =========================================================
+   WEBHOOK NOWPayments — TEM de estar ANTES de Clerk/JSON
+   Caminho público: POST /api/payments/nowpayments
+   ========================================================= */
+app.post(
+  "/api/payments/nowpayments",
+  // raw body para HMAC (não usar express.json aqui!)
+  express.raw({ type: "application/json", limit: "512kb" }),
+  // encaminha para o path interno do router
+  (req, res, next) => {
+    req.url = "/payments/nowpayments";
+    next();
+  },
+  paymentsWebhookRouter
 );
+
+/* ================= Clerk e body parsers (depois do webhook) ================= */
+app.use(clerkMiddleware());
 
 // JSON parser para o resto
 app.use(express.json({ limit: "200kb" }));
@@ -158,8 +169,11 @@ app.use("/api/clerk", clerkRoutes);
 app.use("/api", statusRoutes);
 app.use("/api", storeMinersRoutes);
 
-// Webhook validado (HMAC) — já tem raw body
-app.use("/api/payments/webhook", paymentsWebhookRouter);
+// ❌ REMOVE: router duplicado antigo do webhook
+// app.use("/api/payments/webhook", paymentsWebhookRouter);
+
+// Payments normal (create-intent, intent, sync, qr)
+app.use("/api", paymentsRoutes);
 
 // rotas com auth do utilizador
 function userScope(req, _res, next) {
