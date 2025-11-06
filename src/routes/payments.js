@@ -16,7 +16,7 @@ const NOW_API        = "https://api.nowpayments.io/v1";
 if (!NOW_API_KEY) console.error("[payments] NOWPAYMENTS_API_KEY missing — create-intent vai falhar.");
 
 const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
-const USDC_NETWORKS = ["ERC20", "BEP20"];
+const USDC_NETWORKS = ["ERC20", "BEP20"]; // ERC20 = Ethereum, BEP20 = BSC
 const CURR_TTL_MS = 15 * 60 * 1000;
 let _currCache = { list: null, ts: 0 };
 
@@ -40,7 +40,7 @@ async function invoiceById(id) {
     SELECT
       id,
       user_id,
-      subtotal_amount,     -- É ISTO que tens na BD, o valor a pagar
+      subtotal_amount,     -- valor a pagar
       status,
       provider_payment_id,
       provider_currency,
@@ -147,8 +147,22 @@ const getAuthContext = (req) => {
   return { userId: req.auth?.userId || null, isAdmin: !!isAdmin };
 };
 
+/* =======================================================================
+   COMO MONTAR NO SERVER (ordem importa!)
+   -----------------------------------------------------------------------
+   // ANTES do express.json: webhook cru (bodyParser.raw) + verificação HMAC
+   app.post("/api/payments/nowpayments",
+     bodyParser.raw({ type: "application/json", limit: "512kb" }),
+     npLimiter,
+     verifyNowPayments,
+     (req,res,next)=>{ req.url="/payments/nowpayments"; next(); },
+     paymentsWebhookRouter);
+
+   // DEPOIS: app.use(express.json()); ... app.use("/api", paymentsRouter);
+   ======================================================================= */
+
 /* ===========================================================
-   WEBHOOK ROUTER (monta ANTES do express.json() no server.js)
+   WEBHOOK ROUTER (raw body)
    =========================================================== */
 export const webhookRouter = express.Router();
 
@@ -188,13 +202,6 @@ function verifyNowPayments(req, res, next) {
 
 /**
  * Caminho do webhook: /api/payments/nowpayments
- * No server.js monta assim (antes do express.json()):
- *   app.post("/api/payments/nowpayments",
- *     bodyParser.raw({ type: "application/json", limit: "512kb" }),
- *     npLimiter,
- *     verifyNowPayments,
- *     (req,res,next)=>{ req.url="/payments/nowpayments"; next(); },
- *     paymentsWebhookRouter);
  */
 webhookRouter.post(
   "/payments/nowpayments",
@@ -214,7 +221,7 @@ webhookRouter.post(
         ON CONFLICT (external_id) DO NOTHING;
       `;
 
-      // Reconciliação segura
+      // Reconciliação
       const orderId = String(evt?.order_id || "");
       const invoiceId = orderId.startsWith("invoice_") ? Number(orderId.replace("invoice_", "")) : null;
       if (!invoiceId) return res.status(200).send("ok");
@@ -238,7 +245,7 @@ webhookRouter.post(
 );
 
 /* =======================================
-   ROUTER PRINCIPAL (monta depois do JSON)
+   ROUTER PRINCIPAL (JSON)
    ======================================= */
 const router = express.Router();
 
@@ -300,17 +307,21 @@ router.post("/payments/create-intent", async (req, res) => {
       ipnUrl = `${proto}://${host}/api/payments/nowpayments`;
     }
 
-    // 5) Cria pagamento no PSP
+    // 5) Cria pagamento no PSP (sem FX quando é USDC)
     const price_amount = money2Number(inv.subtotal_amount);
+    const isUSDCSelected = String(pay_currency).toUpperCase().startsWith("USDC");
+    // Regra de ouro: se é USDC, price_currency == pay_currency (evita “pay price” inflado)
+    const price_currency = isUSDCSelected ? pay_currency : "USD";
+
     const payload = {
-      price_amount,                      // 2 casas, número real
-      price_currency: "USD",
-      pay_currency,
+      price_amount,                  // 25.00
+      price_currency,                // "USDC"/"USDCBSC" quando é USDC, senão "USD"
+      pay_currency,                  // "USDC"/"USDCBSC"/"BTC"/"LTC"
       order_id: `invoice_${inv.id}`,
       order_description: `Energia #${inv.id}`,
       ipn_callback_url: ipnUrl,
 
-      // trava “empolamento” do PSP
+      // Cliente paga exatamente o price_amount
       is_fee_paid_by_user: false,
       is_fixed_rate: true,
     };
@@ -335,7 +346,7 @@ router.post("/payments/create-intent", async (req, res) => {
     }
 
     // 6) Decide o que GUARDAS (USDC = subtotal; BTC/LTC = PSP)
-    const isUSDC = String(pay_currency).toUpperCase().startsWith("USDC");
+    const isUSDC = isUSDCSelected; // mesmo check
     const storePayAmount = isUSDC ? Number(price_amount) : (Number(np.pay_amount) || null);
     const storePayAddress = np.pay_address || null;
     const storePayUrl = np.invoice_url || null;
@@ -441,6 +452,9 @@ async function syncHandler(req, res) {
 
     if (status === "finished") {
       await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
+      if (EXTRA_COLS.paid_at) {
+        await sql/*sql*/`UPDATE energy_invoices SET paid_at=NOW() WHERE id=${invoiceId}`;
+      }
     } else if (status === "partially_paid") {
       await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
     } else if (["failed","expired"].includes(status)) {
@@ -495,8 +509,8 @@ router.get("/payments/qr", async (req, res) => {
     } else if (c === "LTC") {
       const amt = amount ? String(amount) : "";
       uri = `litecoin:${address}${amt ? `?amount=${amt}` : ""}`;
-    } else if (c === "USDC") {
-      // estáveis: QR é o address plain. devolve amount formatado em separado.
+    } else if (c.startsWith("USDC")) {
+      // estáveis: QR é address plain
       uri = `${address}`;
     } else {
       uri = String(address);
@@ -504,7 +518,7 @@ router.get("/payments/qr", async (req, res) => {
 
     const qr = await QRCode.toDataURL(uri, { margin: 1, width: 300 });
 
-    if (c === "USDC") {
+    if (c.startsWith("USDC")) {
       const amtStr = amount != null ? money2String(amount) : null;
       return res.json({ ok: true, qr, amount: amtStr });
     }

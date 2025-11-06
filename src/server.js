@@ -30,9 +30,6 @@ import pushRouter from "./routes/push.js";
 import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
 
-// ❌ REMOVE: router antigo e duplicado de webhook
-// import paymentsWebhookRouter from "./routes/paymentsWebhook.js";
-
 dotenv.config();
 
 const PORT = Number(process.env.PORT || 5001);
