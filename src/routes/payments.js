@@ -1,3 +1,4 @@
+// src/routes/payments.js
 import express from "express";
 import bodyParser from "body-parser";
 import rateLimit from "express-rate-limit";
@@ -6,37 +7,47 @@ import crypto from "crypto";
 import QRCode from "qrcode";
 import { sql } from "../config/db.js";
 
-/* ================== ENV ================== */
+/* ================== ENV & CONSTANTS ================== */
 const NOW_API_KEY    = process.env.NOWPAYMENTS_API_KEY || "";
 const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || "";
 const NOW_IPN_URL    = process.env.NOWPAYMENTS_WEBHOOK_URL || "";
 const NOW_API        = "https://api.nowpayments.io/v1";
 
-if (!NOW_API_KEY) console.error("[payments] NOWPAYMENTS_API_KEY missing");
+if (!NOW_API_KEY) console.error("[payments] NOWPAYMENTS_API_KEY missing — create-intent vai falhar.");
 
-/* ================== CONSTS ================== */
 const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
 const USDC_NETWORKS = ["ERC20", "BEP20"];
 const CURR_TTL_MS = 15 * 60 * 1000;
 let _currCache = { list: null, ts: 0 };
 
-/* ================== MONEY (centavos) ================== */
-const toCents = (v) => {
-  if (v == null) return 0;
-  const n = Number(String(v).replace(",", "."));
-  if (!isFinite(n)) return 0;
-  return Math.round(n * 100); // round half-up
-};
-const centsTo2 = (c) => Number((Number(c || 0) / 100).toFixed(2));
-const money2 = (v) => centsTo2(toCents(v)); // normaliza para 2 casas
+/* ===== Dinheiro: SEM IEEE-754, SEM tretas ===== */
+function money2Number(v) {
+  const s = String(v ?? "").trim();
+  if (!s) return 0;
+  const m = s.match(/^(-?\d+)(?:\.(\d+))?$/);
+  if (!m) return Number(Number(v).toFixed(2));
+  const int = m[1];
+  const frac = (m[2] || "").padEnd(2, "0").slice(0, 2);
+  return Number(`${int}.${frac}`);
+}
+function money2String(v) {
+  return money2Number(v).toFixed(2);
+}
 
-/* ================== DB ================== */
+/* ================== DB HELPERS ================== */
 async function invoiceById(id) {
   const [row] = await sql/*sql*/`
-    SELECT id, user_id, year, month,
-           subtotal_amount, status, currency_code,
-           provider_payment_id, provider_currency,
-           pay_network, pay_address, pay_amount, pay_url
+    SELECT
+      id,
+      user_id,
+      subtotal_amount,     -- É ISTO que tens na BD, o valor a pagar
+      status,
+      provider_payment_id,
+      provider_currency,
+      pay_network,
+      pay_address,
+      pay_amount,
+      pay_url
     FROM energy_invoices
     WHERE id = ${id}
     LIMIT 1
@@ -60,7 +71,7 @@ async function txRun(fn) {
   }
 }
 
-/* ================== OPTIONAL COLS ================== */
+/* ================== OPTIONAL COLUMNS (best-effort) ================== */
 const EXTRA_COLS = {
   provider_status: false,
   provider_paid_amount: false,
@@ -71,18 +82,19 @@ const EXTRA_COLS = {
 (async () => {
   try {
     const cols = await sql/*sql*/`
-      SELECT column_name FROM information_schema.columns WHERE table_name = 'energy_invoices'
+      SELECT column_name FROM information_schema.columns
+      WHERE table_name = 'energy_invoices'
     `;
     const names = new Set(cols.map(c => c.column_name));
     for (const k of Object.keys(EXTRA_COLS)) EXTRA_COLS[k] = names.has(k);
   } catch (e) {
-    console.warn("[payments] optional cols detection failed:", e?.message || e);
+    console.warn("[payments] optional columns detection failed:", e?.message || e);
   }
 })();
 
 /* ================== PSP HELPERS ================== */
 async function getNowCurrenciesCached() {
-  if (!NOW_API_KEY) throw new Error("PSP not configured");
+  if (!NOW_API_KEY) throw new Error("PSP not configured: NOWPAYMENTS_API_KEY missing");
   const now = Date.now();
   if (_currCache.list && now - _currCache.ts < CURR_TTL_MS) return _currCache.list;
   const r = await fetch(`${NOW_API}/currencies`, { headers: { "x-api-key": NOW_API_KEY } });
@@ -90,7 +102,7 @@ async function getNowCurrenciesCached() {
   let data; try { data = JSON.parse(raw); } catch { data = raw; }
   if (!r.ok) {
     const msg = (data && (data.message || data.error)) ? (data.message || data.error) : raw;
-    throw new Error(`NOW /currencies ${r.status}: ${msg}`);
+    throw new Error(`NOWPayments /currencies HTTP ${r.status}: ${msg}`);
   }
   const list = Array.isArray(data) ? data : (data.currencies || data.supported_currencies || []);
   _currCache = { list: list.map(s => String(s).toUpperCase()), ts: now };
@@ -105,20 +117,20 @@ async function mapPayCurrency(currency, network) {
   if (c === "USDC") {
     if (!USDC_NETWORKS.includes(n)) throw new Error("Rede inválida para USDC");
     if (n === "ERC20") {
-      if (!list.includes("USDC")) throw new Error("USDC(ERC20) indisponível");
+      if (!list.includes("USDC")) throw new Error("USDC(ERC20) indisponível no PSP");
       return "USDC";
     }
     if (n === "BEP20") {
-      if (!list.includes("USDCBSC")) throw new Error("USDC(BEP20) indisponível");
+      if (!list.includes("USDCBSC")) throw new Error("USDC(BEP20) indisponível no PSP");
       return "USDCBSC";
     }
   }
   if (c === "BTC") {
-    if (!list.includes("BTC")) throw new Error("BTC indisponível");
+    if (!list.includes("BTC")) throw new Error("BTC indisponível no PSP");
     return "BTC";
   }
   if (c === "LTC") {
-    if (!list.includes("LTC")) throw new Error("LTC indisponível");
+    if (!list.includes("LTC")) throw new Error("LTC indisponível no PSP");
     return "LTC";
   }
   throw new Error("Moeda não suportada");
@@ -136,11 +148,16 @@ const getAuthContext = (req) => {
 };
 
 /* ===========================================================
-   WEBHOOK (monta ANTES do express.json() no server)
+   WEBHOOK ROUTER (monta ANTES do express.json() no server.js)
    =========================================================== */
 export const webhookRouter = express.Router();
 
-const npLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
+const npLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 function verifyNowPayments(req, res, next) {
   try {
@@ -152,18 +169,33 @@ function verifyNowPayments(req, res, next) {
     const hmac = crypto.createHmac("sha512", NOW_IPN_SECRET).update(payloadBuf).digest("hex");
     const a = Buffer.from(hmac.toLowerCase(), "utf8");
     const b = Buffer.from(String(sigHeader).toLowerCase(), "utf8");
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return res.status(401).send("Invalid signature");
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(401).send("Invalid signature");
+    }
 
     let parsed;
-    try { parsed = JSON.parse(payloadBuf.toString("utf8")); }
-    catch { return res.status(400).send("Invalid JSON"); }
+    try {
+      parsed = JSON.parse(payloadBuf.toString("utf8"));
+    } catch {
+      return res.status(400).send("Invalid JSON");
+    }
     req.ipn = parsed;
     next();
-  } catch {
+  } catch (_e) {
     return res.status(400).send("Invalid webhook");
   }
 }
 
+/**
+ * Caminho do webhook: /api/payments/nowpayments
+ * No server.js monta assim (antes do express.json()):
+ *   app.post("/api/payments/nowpayments",
+ *     bodyParser.raw({ type: "application/json", limit: "512kb" }),
+ *     npLimiter,
+ *     verifyNowPayments,
+ *     (req,res,next)=>{ req.url="/payments/nowpayments"; next(); },
+ *     paymentsWebhookRouter);
+ */
 webhookRouter.post(
   "/payments/nowpayments",
   bodyParser.raw({ type: "application/json" }),
@@ -175,25 +207,26 @@ webhookRouter.post(
       const externalId = String(evt?.payment_id || evt?.invoice_id || evt?.ipn_id || "").trim();
       if (!externalId) return res.status(400).send("Missing external id");
 
+      // log bruto idempotente
       await sql/*sql*/`
         INSERT INTO payments_ipn (provider, external_id, payload)
         VALUES ('nowpayments', ${externalId}, ${sql.json(evt)})
         ON CONFLICT (external_id) DO NOTHING;
       `;
 
+      // Reconciliação segura
       const orderId = String(evt?.order_id || "");
       const invoiceId = orderId.startsWith("invoice_") ? Number(orderId.replace("invoice_", "")) : null;
       if (!invoiceId) return res.status(200).send("ok");
 
-      const st = normalizeProviderStatus(evt.payment_status);
-
+      const paymentStatus = normalizeProviderStatus(evt.payment_status);
       if (EXTRA_COLS.provider_status)
-        await sql/*sql*/`UPDATE energy_invoices SET provider_status=${st} WHERE id=${invoiceId}`;
-      if (st === "finished")
+        await sql/*sql*/`UPDATE energy_invoices SET provider_status=${paymentStatus} WHERE id=${invoiceId}`;
+      if (paymentStatus === "finished")
         await sql/*sql*/`UPDATE energy_invoices SET status='pago' WHERE id=${invoiceId}`;
-      else if (st === "partially_paid")
+      else if (paymentStatus === "partially_paid")
         await sql/*sql*/`UPDATE energy_invoices SET status='aguarda_pagamento' WHERE id=${invoiceId}`;
-      else if (["failed","expired"].includes(st))
+      else if (["failed","expired"].includes(paymentStatus))
         await sql/*sql*/`UPDATE energy_invoices SET status='pendente' WHERE id=${invoiceId}`;
 
       return res.status(200).send("ok");
@@ -205,11 +238,11 @@ webhookRouter.post(
 );
 
 /* =======================================
-   ROUTER PRINCIPAL (depois do express.json)
+   ROUTER PRINCIPAL (monta depois do JSON)
    ======================================= */
 const router = express.Router();
 
-/** Create intent (idempotente; usa SEMPRE subtotal_amount em 2 casas) */
+/** Create intent */
 router.post("/payments/create-intent", async (req, res) => {
   const { userId, isAdmin } = getAuthContext(req);
   try {
@@ -223,15 +256,17 @@ router.post("/payments/create-intent", async (req, res) => {
 
     let net = String(network || "").toUpperCase();
     if (cur === "USDC" && !USDC_NETWORKS.includes(net)) return res.status(400).json({ error: "Rede inválida para USDC" });
-    if (cur !== "USDC") net = "NATIVE";
+    if (cur !== "USDC") net = "NATIVE"; // BTC/LTC
 
+    // 1) Lê a fatura e autoriza
     const inv = await invoiceById(Number(invoiceId));
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
     if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
     if (inv.status === "pago") return res.status(409).json({ error: "Fatura já paga" });
 
-    // Reusar intent ativo
+    // 2) Reusar intent ativo
     if (inv.provider_payment_id && inv.status === "aguarda_pagamento") {
+      const reusedIsUSDC = String(inv.provider_currency || "").toUpperCase().startsWith("USDC");
       return res.json({
         ok: true,
         intent: {
@@ -239,8 +274,8 @@ router.post("/payments/create-intent", async (req, res) => {
           currency: cur,
           network: inv.pay_network || net,
           provider_currency: inv.provider_currency || null,
-          amount_fiat: money2(inv.subtotal_amount),
-          amount_crypto: inv.pay_amount,
+          amount_fiat: money2Number(inv.subtotal_amount),
+          amount_crypto: reusedIsUSDC ? money2Number(inv.subtotal_amount) : inv.pay_amount,
           payment_address: inv.pay_address,
           pay_url: inv.pay_url,
           status: inv.status,
@@ -248,15 +283,16 @@ router.post("/payments/create-intent", async (req, res) => {
       });
     }
 
-    // Mapeia moeda+rede
+    // 3) Mapeia moeda+rede
     let pay_currency;
     try {
       pay_currency = await mapPayCurrency(cur, net);
-    } catch (e) {
-      return res.status(400).json({ error: String(e?.message || e) });
+    } catch (mapErr) {
+      console.warn("[payments] mapPayCurrency failed:", { cur, net, msg: String(mapErr?.message || mapErr) });
+      return res.status(400).json({ error: String(mapErr?.message || mapErr) });
     }
 
-    // IPN URL
+    // 4) IPN URL
     let ipnUrl = NOW_IPN_URL;
     if (!ipnUrl) {
       const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
@@ -264,17 +300,19 @@ router.post("/payments/create-intent", async (req, res) => {
       ipnUrl = `${proto}://${host}/api/payments/nowpayments`;
     }
 
-    // Montante a cobrar
-    const price_amount = money2(inv.subtotal_amount); // 2 casas, sem drift
-
-    // Chamada PSP
+    // 5) Cria pagamento no PSP
+    const price_amount = money2Number(inv.subtotal_amount);
     const payload = {
-      price_amount,
+      price_amount,                      // 2 casas, número real
       price_currency: "USD",
       pay_currency,
       order_id: `invoice_${inv.id}`,
       order_description: `Energia #${inv.id}`,
       ipn_callback_url: ipnUrl,
+
+      // trava “empolamento” do PSP
+      is_fee_paid_by_user: false,
+      is_fixed_rate: true,
     };
 
     let np, raw;
@@ -296,7 +334,13 @@ router.post("/payments/create-intent", async (req, res) => {
       return res.status(502).json({ error: "Erro PSP (network)", detail: String(e?.message || e) });
     }
 
-    // Persistir provider data
+    // 6) Decide o que GUARDAS (USDC = subtotal; BTC/LTC = PSP)
+    const isUSDC = String(pay_currency).toUpperCase().startsWith("USDC");
+    const storePayAmount = isUSDC ? Number(price_amount) : (Number(np.pay_amount) || null);
+    const storePayAddress = np.pay_address || null;
+    const storePayUrl = np.invoice_url || null;
+    const providerStatus = normalizeProviderStatus(np.payment_status);
+
     await txRun(async () => {
       await sql/*sql*/`
         UPDATE energy_invoices
@@ -304,16 +348,16 @@ router.post("/payments/create-intent", async (req, res) => {
             provider_payment_id=${Number(np.payment_id)},
             provider_currency=${pay_currency},
             pay_network=${net},
-            pay_address=${np.pay_address || null},
-            pay_amount=${np.pay_amount || null},
-            pay_url=${np.invoice_url || null},
+            pay_address=${storePayAddress},
+            pay_amount=${storePayAmount},
+            pay_url=${storePayUrl},
             updated_at=NOW()
         WHERE id=${inv.id}
       `;
       if (EXTRA_COLS.provider_status) {
         await sql/*sql*/`
           UPDATE energy_invoices
-          SET provider_status=${normalizeProviderStatus(np.payment_status)}
+          SET provider_status=${providerStatus}
           WHERE id=${inv.id}
         `;
       }
@@ -326,10 +370,10 @@ router.post("/payments/create-intent", async (req, res) => {
         currency: cur,
         network: net,
         provider_currency: pay_currency,
-        amount_fiat: price_amount,
-        amount_crypto: np.pay_amount || null,
-        payment_address: np.pay_address || null,
-        pay_url: np.invoice_url || null,
+        amount_fiat: price_amount,                 // 2 casas
+        amount_crypto: storePayAmount,             // USDC: == subtotal_amount
+        payment_address: storePayAddress,
+        pay_url: storePayUrl,
         status: "pending",
       },
     });
@@ -350,6 +394,8 @@ router.get("/payments/intent", async (req, res) => {
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
     if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
 
+    const isUSDCRow = String(inv.provider_currency || "").toUpperCase().startsWith("USDC");
+
     return res.json({
       ok: true,
       intent: {
@@ -359,8 +405,8 @@ router.get("/payments/intent", async (req, res) => {
         provider_currency: inv.provider_currency,
         network: inv.pay_network,
         payment_address: inv.pay_address,
-        amount_crypto: inv.pay_amount,
-        amount_fiat: money2(inv.subtotal_amount),
+        amount_crypto: isUSDCRow ? money2Number(inv.subtotal_amount) : inv.pay_amount,
+        amount_fiat: money2Number(inv.subtotal_amount),
         pay_url: inv.pay_url,
       },
     });
@@ -370,7 +416,7 @@ router.get("/payments/intent", async (req, res) => {
   }
 });
 
-/** Sync (GET/POST) */
+/** Sync (GET or POST) */
 async function syncHandler(req, res) {
   const { userId, isAdmin } = getAuthContext(req);
   try {
@@ -382,7 +428,9 @@ async function syncHandler(req, res) {
     if (!canAccess(inv, userId, isAdmin)) return res.status(403).json({ error: "forbidden" });
     if (!inv.provider_payment_id) return res.status(400).json({ error: "sem provider_payment_id" });
 
-    const r = await fetch(`${NOW_API}/payment/${inv.provider_payment_id}`, { headers: { "x-api-key": NOW_API_KEY } });
+    const r = await fetch(`${NOW_API}/payment/${inv.provider_payment_id}`, {
+      headers: { "x-api-key": NOW_API_KEY },
+    });
     const p = await r.json().catch(() => ({}));
     if (!r.ok) {
       const msg = p?.message || p?.error || JSON.stringify(p || {});
@@ -411,7 +459,7 @@ async function syncHandler(req, res) {
 router.post("/payments/sync", syncHandler);
 router.get("/payments/sync", syncHandler);
 
-/** Status */
+/** Status (GET) — simples para UI */
 router.get("/payments/status", async (req, res) => {
   try {
     const invoiceId = Number(req.query.invoiceId);
@@ -419,12 +467,13 @@ router.get("/payments/status", async (req, res) => {
     const inv = await invoiceById(invoiceId);
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
+    const isUSDCRow = String(inv.provider_currency || "").toUpperCase().startsWith("USDC");
     return res.json({
       id: inv.id,
       status: inv.status,
       provider_status: EXTRA_COLS.provider_status ? inv.provider_status ?? null : null,
-      amount_fiat: money2(inv.subtotal_amount),
-      amount_crypto: inv.pay_amount,
+      amount_fiat: money2Number(inv.subtotal_amount),
+      amount_crypto: isUSDCRow ? money2Number(inv.subtotal_amount) : inv.pay_amount,
     });
   } catch (err) {
     console.error("status:", err);
@@ -436,8 +485,7 @@ router.get("/payments/status", async (req, res) => {
 router.get("/payments/qr", async (req, res) => {
   try {
     const { address, amount, currency } = req.query;
-    if (!address || !currency)
-      return res.status(400).json({ error: "address e currency são obrigatórios" });
+    if (!address || !currency) return res.status(400).json({ error: "address e currency são obrigatórios" });
 
     const c = String(currency).toUpperCase();
     let uri = "";
@@ -448,7 +496,8 @@ router.get("/payments/qr", async (req, res) => {
       const amt = amount ? String(amount) : "";
       uri = `litecoin:${address}${amt ? `?amount=${amt}` : ""}`;
     } else if (c === "USDC") {
-      uri = `${address}`; // stable: só address
+      // estáveis: QR é o address plain. devolve amount formatado em separado.
+      uri = `${address}`;
     } else {
       uri = String(address);
     }
@@ -456,10 +505,9 @@ router.get("/payments/qr", async (req, res) => {
     const qr = await QRCode.toDataURL(uri, { margin: 1, width: 300 });
 
     if (c === "USDC") {
-      const amtStr = amount != null ? money2(amount).toFixed(2) : null;
+      const amtStr = amount != null ? money2String(amount) : null;
       return res.json({ ok: true, qr, amount: amtStr });
     }
-
     return res.json({ ok: true, qr });
   } catch (err) {
     console.error("qr:", err);
