@@ -1,4 +1,3 @@
-// src/routes/payments.js
 import express from "express";
 import bodyParser from "body-parser";
 import rateLimit from "express-rate-limit";
@@ -10,37 +9,38 @@ import { sql } from "../config/db.js";
 /* ================== ENV & CONSTANTS ================== */
 const NOW_API_KEY    = process.env.NOWPAYMENTS_API_KEY || "";
 const NOW_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || "";
-const NOW_IPN_URL    = process.env.NOWPAYMENTS_WEBHOOK_URL || ""; // pode faltar; criamos fallback dinâmico
+const NOW_IPN_URL    = process.env.NOWPAYMENTS_WEBHOOK_URL || ""; // opcional
 const NOW_API        = "https://api.nowpayments.io/v1";
 
-if (!NOW_API_KEY) {
-  console.error("[payments] NOWPAYMENTS_API_KEY missing — create-intent vai falhar.");
-}
+if (!NOW_API_KEY) console.error("[payments] NOWPAYMENTS_API_KEY missing — create-intent vai falhar.");
 
 const SUPPORTED_CURRENCIES = ["USDC", "BTC", "LTC"];
 const USDC_NETWORKS = ["ERC20", "BEP20"];
 const CURR_TTL_MS = 15 * 60 * 1000;
 let _currCache = { list: null, ts: 0 };
 
-/* ===== Dinheiro: 2 casas SEMPRE (sem erro IEEE-754) ===== */
-function money2Number(v) {
-  const s = String(v ?? "").trim();
-  if (!s) return 0;
-  const m = s.match(/^(-?\d+)(?:\.(\d+))?$/);
-  if (!m) return Number(Number(v).toFixed(2));
-  const int = m[1];
-  const frac = (m[2] || "").padEnd(2, "0").slice(0, 2);
-  return Number(`${int}.${frac}`);
+/* ================== MONEY (centavos, round half-up) ================== */
+function toCentsStrict(v) {
+  if (v == null) return 0;
+  const n = Number(String(v).replace(",", "."));
+  if (!isFinite(n)) return 0;
+  return Math.round(n * 100);
 }
-function money2String(v) {
-  return money2Number(v).toFixed(2);
+function centsToNumber(cents) {
+  return Number((Number(cents || 0) / 100).toFixed(2));
+}
+function normalizeMoney2(v) {
+  return centsToNumber(toCentsStrict(v));
 }
 
 /* ================== DB HELPERS ================== */
 async function invoiceById(id) {
   const [row] = await sql/*sql*/`
-    SELECT id, user_id, subtotal_amount, status,
-           provider_payment_id, provider_currency, pay_network, pay_address, pay_amount, pay_url
+    SELECT id, user_id, year, month,
+           subtotal_amount, total_amount,
+           status, currency_code,
+           provider_payment_id, provider_currency,
+           pay_network, pay_address, pay_amount, pay_url
     FROM energy_invoices
     WHERE id = ${id}
     LIMIT 1
@@ -64,7 +64,7 @@ async function txRun(fn) {
   }
 }
 
-/* ================== OPTIONAL COLUMNS (best-effort) ================== */
+/* ================== OPTIONAL COLUMNS ================== */
 const EXTRA_COLS = {
   provider_status: false,
   provider_paid_amount: false,
@@ -144,7 +144,6 @@ const getAuthContext = (req) => {
    =========================================================== */
 export const webhookRouter = express.Router();
 
-// limiter específico p/ webhook
 const npLimiter = rateLimit({
   windowMs: 60_000,
   limit: 20,
@@ -167,11 +166,8 @@ function verifyNowPayments(req, res, next) {
     }
 
     let parsed;
-    try {
-      parsed = JSON.parse(payloadBuf.toString("utf8"));
-    } catch {
-      return res.status(400).send("Invalid JSON");
-    }
+    try { parsed = JSON.parse(payloadBuf.toString("utf8")); }
+    catch { return res.status(400).send("Invalid JSON"); }
     req.ipn = parsed;
     next();
   } catch (_e) {
@@ -179,16 +175,6 @@ function verifyNowPayments(req, res, next) {
   }
 }
 
-/**
- * Caminho do webhook: /api/payments/nowpayments
- * MONTA isto cedo no server:
- *   app.post("/api/payments/nowpayments",
- *     bodyParser.raw({ type: "application/json", limit: "512kb" }),
- *     npLimiter,
- *     verifyNowPayments,
- *     (req,res,next)=>{ req.url="/payments/nowpayments"; next(); },
- *     paymentsRoutes);
- */
 webhookRouter.post(
   "/payments/nowpayments",
   bodyParser.raw({ type: "application/json" }),
@@ -200,20 +186,17 @@ webhookRouter.post(
       const externalId = String(evt?.payment_id || evt?.invoice_id || evt?.ipn_id || "").trim();
       if (!externalId) return res.status(400).send("Missing external id");
 
-      // log bruto idempotente
       await sql/*sql*/`
         INSERT INTO payments_ipn (provider, external_id, payload)
         VALUES ('nowpayments', ${externalId}, ${sql.json(evt)})
         ON CONFLICT (external_id) DO NOTHING;
       `;
 
-      // Reconciliação segura
       const orderId = String(evt?.order_id || "");
       const invoiceId = orderId.startsWith("invoice_") ? Number(orderId.replace("invoice_", "")) : null;
       if (!invoiceId) return res.status(200).send("ok");
 
       const paymentStatus = normalizeProviderStatus(evt.payment_status);
-      // Atualizações mínimas idempotentes
       if (EXTRA_COLS.provider_status)
         await sql/*sql*/`UPDATE energy_invoices SET provider_status=${paymentStatus} WHERE id=${invoiceId}`;
       if (paymentStatus === "finished")
@@ -236,7 +219,7 @@ webhookRouter.post(
    ======================================= */
 const router = express.Router();
 
-/** Create intent */
+/** Create intent (idempotente, valores em 2 casas) */
 router.post("/payments/create-intent", async (req, res) => {
   const { userId, isAdmin } = getAuthContext(req);
   try {
@@ -264,9 +247,10 @@ router.post("/payments/create-intent", async (req, res) => {
         ok: true,
         intent: {
           invoice_id: inv.id,
-          currency: inv.provider_currency || cur,
+          currency: cur,
           network: inv.pay_network || net,
-          amount_fiat: money2Number(inv.subtotal_amount),
+          provider_currency: inv.provider_currency || null,
+          amount_fiat: normalizeMoney2(inv.total_amount ?? inv.subtotal_amount),
           amount_crypto: inv.pay_amount,
           payment_address: inv.pay_address,
           pay_url: inv.pay_url,
@@ -292,10 +276,13 @@ router.post("/payments/create-intent", async (req, res) => {
       ipnUrl = `${proto}://${host}/api/payments/nowpayments`;
     }
 
-    // 5) Cria pagamento no PSP
-    const price_amount = money2Number(inv.subtotal_amount);
+    // 5) Montante FIAT a cobrar (sempre 2 casas)
+    const price_cents = toCentsStrict(inv.total_amount ?? inv.subtotal_amount);
+    const price_amount = centsToNumber(price_cents);
+
+    // 6) Chamada ao PSP
     const payload = {
-      price_amount,                         // SEMPRE 2 casas
+      price_amount,
       price_currency: "USD",
       pay_currency,
       order_id: `invoice_${inv.id}`,
@@ -320,7 +307,7 @@ router.post("/payments/create-intent", async (req, res) => {
       return res.status(502).json({ error: "Erro PSP (network)", detail: String(e?.message || e) });
     }
 
-    // 6) UPDATE (tx)
+    // 7) UPDATE (tx) — normaliza subtotal_amount para 2 casas (higiene)
     await txRun(async () => {
       await sql/*sql*/`
         UPDATE energy_invoices
@@ -331,6 +318,7 @@ router.post("/payments/create-intent", async (req, res) => {
             pay_address=${np.pay_address || null},
             pay_amount=${np.pay_amount || null},
             pay_url=${np.invoice_url || null},
+            subtotal_amount=${price_amount},
             updated_at=NOW()
         WHERE id=${inv.id}
       `;
@@ -350,8 +338,8 @@ router.post("/payments/create-intent", async (req, res) => {
         currency: cur,
         network: net,
         provider_currency: pay_currency,
-        amount_fiat: price_amount,                 // 2 casas
-        amount_crypto: np.pay_amount || null,      // crypto vem do PSP (não forças casas)
+        amount_fiat: price_amount,
+        amount_crypto: np.pay_amount || null,
         payment_address: np.pay_address || null,
         pay_url: np.invoice_url || null,
         status: "pending",
@@ -384,7 +372,7 @@ router.get("/payments/intent", async (req, res) => {
         network: inv.pay_network,
         payment_address: inv.pay_address,
         amount_crypto: inv.pay_amount,
-        amount_fiat: money2Number(inv.subtotal_amount), // 2 casas
+        amount_fiat: normalizeMoney2(inv.total_amount ?? inv.subtotal_amount),
         pay_url: inv.pay_url,
       },
     });
@@ -437,7 +425,7 @@ async function syncHandler(req, res) {
 router.post("/payments/sync", syncHandler);
 router.get("/payments/sync", syncHandler);
 
-/** Status (GET) — usado no fallback do frontend */
+/** Status (GET) — fallback do frontend */
 router.get("/payments/status", async (req, res) => {
   try {
     const invoiceId = Number(req.query.invoiceId);
@@ -445,14 +433,13 @@ router.get("/payments/status", async (req, res) => {
     const inv = await invoiceById(invoiceId);
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });
 
-    const payload = {
+    return res.json({
       id: inv.id,
       status: inv.status,
       provider_status: EXTRA_COLS.provider_status ? inv.provider_status ?? null : null,
-      amount_fiat: money2Number(inv.subtotal_amount),
+      amount_fiat: normalizeMoney2(inv.total_amount ?? inv.subtotal_amount),
       amount_crypto: inv.pay_amount,
-    };
-    return res.json(payload);
+    });
   } catch (err) {
     console.error("status:", err);
     return res.status(500).json({ error: "Erro interno" });
@@ -475,17 +462,16 @@ router.get("/payments/qr", async (req, res) => {
       const amt = amount ? String(amount) : "";
       uri = `litecoin:${address}${amt ? `?amount=${amt}` : ""}`;
     } else if (c === "USDC") {
-      // estáveis não têm URI universal — QR é só o address
-      uri = `${address}`;
+      uri = `${address}`; // stable: só address
     } else {
       uri = String(address);
     }
 
     const qr = await QRCode.toDataURL(uri, { margin: 1, width: 300 });
 
-    // Para USDC devolvemos o amount normalizado à parte, para a UI usar
     if (c === "USDC") {
-      const amtStr = amount != null ? money2String(amount) : null;
+      // devolve amount normalizado para a UI
+      const amtStr = amount != null ? centsToNumber(toCentsStrict(amount)).toFixed(2) : null;
       return res.json({ ok: true, qr, amount: amtStr });
     }
 
