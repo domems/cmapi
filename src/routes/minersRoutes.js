@@ -6,23 +6,19 @@ import {
   getMinerStateHistory,
 } from "../controllers/minersController.js";
 
+// src/routes/minersRoutes.js
 const router = express.Router();
 
-/**
- * Ordem importa. Rotas específicas primeiro.
- * MUITO IMPORTANTE: /user/:userId TEM de vir ANTES de "/:id"
- */
+// 1º: histórico
+router.get("/:id/state-history", getMinerStateHistory);
 
-// atualizar como cliente
+// 2º: update cliente
 router.put("/cliente/:id", atualizarMinerComoCliente);
 
-
-// LISTAR por utilizador (<<< ANTES do "/:id")
+// 3º: listar por user
 router.get("/user/:userId", listarMinersPorUser);
 
-// ler por id
+// 4º: obter por id
 router.get("/:id", obterMinerPorId);
-
-router.get("/:id/state-history", getMinerStateHistory);
 
 export default router;

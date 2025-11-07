@@ -70,18 +70,20 @@ export async function getMinerStateHistory(req, res) {
       LIMIT ${limit};
     `;
 
-    // CORREÇÃO: aceitar from_state NULL; to_state tem de ser válido
+    // aceitar from_state NULL, validar to_state
     const safe = rows.filter(r =>
-      ALLOWED_STATES.has(r.to_state) &&
-      (r.from_state == null || ALLOWED_STATES.has(r.from_state))
+      ALLOWED_STATES.has((r.to_state || "").toUpperCase()) &&
+      (r.from_state == null || ALLOWED_STATES.has((r.from_state || "").toUpperCase()))
     );
 
-    res.json({ items: safe });
+    console.log(TAG, { minerId, got: rows.length, safe: safe.length });
+    return res.status(200).json({ items: safe }); // <- SEMPRE 200
   } catch (e) {
     try { console.error(TAG, e); } catch {}
-    res.status(500).json({ error: "failed to fetch miner state history" });
+    return res.status(500).json({ error: "failed to fetch miner state history" });
   }
 }
+
 
 
 
