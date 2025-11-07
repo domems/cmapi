@@ -10,7 +10,7 @@ import {
 const router = express.Router();
 
 // 1º: histórico
-router.get("state/:id/state-history", getMinerStateHistory);
+router.get("/state/:id/state-history", getMinerStateHistory);
 
 // 2º: update cliente
 router.put("/cliente/:id", atualizarMinerComoCliente);
