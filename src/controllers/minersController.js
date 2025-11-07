@@ -48,15 +48,12 @@ const ALLOWED_STATES = new Set(["ONLINE","OFFLINE","MAINTENANCE","STALE"]);
 export async function getMinerStateHistory(req, res) {
   try {
     const minerId = Number(req.params.id);
-    const limit = Math.min(Number(req.query.limit || 50), 200);
+    const rawLimit = Number(req.query.limit || 50);
+    const limit = Math.max(1, Math.min(rawLimit, 200));
 
     if (!Number.isInteger(minerId)) {
       return res.status(400).json({ error: "invalid miner id" });
     }
-
-    // (Opcional) validar que o miner pertence ao utilizador autenticado
-    // Se já tens middleware/guard, mantém. Se não, valida aqui.
-    // const userId = req.auth.userId; ... SELECT owner_user_id FROM miners WHERE id=$1
 
     const rows = await sql/*sql*/`
       SELECT
@@ -73,8 +70,11 @@ export async function getMinerStateHistory(req, res) {
       LIMIT ${limit};
     `;
 
-    // sanity: filtra estados inválidos se alguém meteu porcaria
-    const safe = rows.filter(r => ALLOWED_STATES.has(r.from_state) && ALLOWED_STATES.has(r.to_state));
+    // CORREÇÃO: aceitar from_state NULL; to_state tem de ser válido
+    const safe = rows.filter(r =>
+      ALLOWED_STATES.has(r.to_state) &&
+      (r.from_state == null || ALLOWED_STATES.has(r.from_state))
+    );
 
     res.json({ items: safe });
   } catch (e) {
@@ -84,140 +84,6 @@ export async function getMinerStateHistory(req, res) {
 }
 
 
-/* ===================== Criar ===================== */
-export const criarMiner = async (req, res) => {
-  const {
-    user_id,
-    nome,
-    modelo,
-    hash_rate,
-    preco_kw,
-    consumo_kw_hora,
-    status,
-    worker_name,
-    api_key,
-    secret_key,
-    coin,
-    pool,
-    locked, // default true
-  } = req.body || {};
-
-  try {
-    const nomeClean = String(nome || "").trim();
-    if (!user_id || !nomeClean) {
-      return res.status(400).json({ error: "Campos obrigatórios em falta: user_id e nome." });
-    }
-
-    let hashRateNum = null,
-      precoKwNum = null,
-      consumoNum = null;
-    try {
-      hashRateNum = normalizeDecimal(hash_rate);
-      precoKwNum = normalizeDecimal(preco_kw);
-      consumoNum = normalizeDecimal(consumo_kw_hora);
-    } catch (e) {
-      return res.status(400).json({ error: String(e.message || e) });
-    }
-
-    const lockedVal = typeof locked === "boolean" ? locked : true;
-    const statusVal = status ? String(status).toLowerCase() : "offline";
-
-    const [novoMiner] = await sql/*sql*/`
-      INSERT INTO miners (
-        user_id, nome, modelo, hash_rate, preco_kw, consumo_kw_hora, status,
-        worker_name, api_key, secret_key, coin, pool, locked
-      ) VALUES (
-        ${user_id},
-        ${nomeClean},
-        ${modelo ? String(modelo).trim() : null},
-        ${hashRateNum},
-        ${precoKwNum},
-        ${consumoNum},
-        ${statusVal},
-        ${worker_name ? String(worker_name).trim() : null},
-        ${api_key ? String(api_key).trim() : null},
-        ${secret_key ? String(secret_key).trim() : null},
-        ${coin ? String(coin).trim() : null},
-        ${pool ? String(pool).trim() : null},
-        ${lockedVal}
-      )
-      RETURNING *;
-    `;
-
-    invalidateUserList(String(user_id));
-    res.status(201).json(novoMiner);
-  } catch (err) {
-    console.error("Erro ao criar miner:", err);
-    res.status(500).json({ error: "Erro ao criar miner" });
-  }
-};
-
-/* ===================== Atualizar (Admin) ===================== */
-export const atualizarMinerComoAdmin = async (req, res) => {
-  const id = parseIntIdOr400(req, res);
-  if (id === null) return;
-
-  const {
-    user_id,
-    nome,
-    modelo,
-    hash_rate,
-    preco_kw,
-    consumo_kw_hora,
-    status,
-    worker_name,
-    api_key,
-    secret_key,
-    coin,
-    pool,
-    locked,
-  } = req.body || {};
-
-  try {
-    let hashRateNum,
-      precoKwNum,
-      consumoNum;
-    try {
-      if (hash_rate !== undefined) hashRateNum = normalizeDecimal(hash_rate);
-      if (preco_kw !== undefined) precoKwNum = normalizeDecimal(preco_kw);
-      if (consumo_kw_hora !== undefined) consumoNum = normalizeDecimal(consumo_kw_hora);
-    } catch (e) {
-      return res.status(400).json({ error: String(e.message || e) });
-    }
-
-    const [updated] = await sql/*sql*/`
-      UPDATE miners
-      SET
-        user_id           = COALESCE(${user_id ?? null}, user_id),
-        nome              = COALESCE(${nome !== undefined ? String(nome).trim() : null}, nome),
-        modelo            = COALESCE(${modelo !== undefined ? String(modelo).trim() : null}, modelo),
-        hash_rate         = COALESCE(${hashRateNum ?? null}, hash_rate),
-        preco_kw          = COALESCE(${precoKwNum ?? null}, preco_kw),
-        consumo_kw_hora   = COALESCE(${consumoNum ?? null}, consumo_kw_hora),
-        status            = COALESCE(${status !== undefined ? String(status).toLowerCase() : null}, status),
-        worker_name       = COALESCE(${worker_name ?? null}, worker_name),
-        api_key           = COALESCE(${api_key ?? null}, api_key),
-        secret_key        = COALESCE(${secret_key ?? null}, secret_key),
-        coin              = COALESCE(${coin ?? null}, coin),
-        pool              = COALESCE(${pool ?? null}, pool),
-        locked            = COALESCE(${locked ?? null}, locked),
-        updated_at        = NOW()
-      WHERE id = ${id}
-      RETURNING *;
-    `;
-
-    if (!updated) return res.status(404).json({ error: "Miner não encontrada." });
-
-    // invalida cache do dono (antigo e/ou novo user, se mudou)
-    const targetUserId = updated.user_id ?? user_id;
-    if (targetUserId) invalidateUserList(String(targetUserId));
-
-    res.json(updated);
-  } catch (err) {
-    console.error("Erro ao atualizar miner (admin):", err);
-    res.status(500).json({ error: "Erro ao atualizar miner (admin)" });
-  }
-};
 
 /* ========== Atualização por cliente (campos do cliente) ========== */
 export const atualizarMinerComoCliente = async (req, res) => {
@@ -314,45 +180,4 @@ export const listarMinersPorUser = async (req, res) => {
   }
 };
 
-/* ===================== Status & Delete ===================== */
-export const atualizarStatusMiner = async (req, res) => {
-  const id = parseIntIdOr400(req, res);
-  if (id === null) return;
 
-  const { status } = req.body || {};
-  try {
-    if (status !== undefined) {
-      const clean = String(status).toLowerCase();
-      if (!["online", "offline", "maintenance"].includes(clean)) {
-        return res.status(400).json({ error: "Status inválido (use 'online' | 'offline' | 'maintenance')." });
-      }
-    }
-    const [updatedMiner] = await sql/*sql*/`
-      UPDATE miners
-      SET status = ${status}, updated_at = NOW()
-      WHERE id = ${id}
-      RETURNING *;
-    `;
-
-    if (updatedMiner?.user_id) invalidateUserList(String(updatedMiner.user_id));
-    res.json(updatedMiner);
-  } catch (err) {
-    console.error("Erro ao atualizar status:", err);
-    res.status(500).json({ error: "Erro ao atualizar status do miner" });
-  }
-};
-
-export const apagarMiner = async (req, res) => {
-  const id = parseIntIdOr400(req, res);
-  if (id === null) return;
-
-  try {
-    const [curr] = await sql/*sql*/`SELECT user_id FROM miners WHERE id = ${id} LIMIT 1`;
-    await sql/*sql*/`DELETE FROM miners WHERE id = ${id}`;
-    if (curr?.user_id) invalidateUserList(String(curr.user_id));
-    res.status(204).send();
-  } catch (err) {
-    console.error("Erro ao apagar miner:", err);
-    res.status(500).json({ error: "Erro ao apagar miner" });
-  }
-};

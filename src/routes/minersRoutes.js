@@ -23,6 +23,6 @@ router.get("/user/:userId", listarMinersPorUser);
 // ler por id
 router.get("/:id", obterMinerPorId);
 
-router.get("/miners/:id/state-history", getMinerStateHistory);
+router.get("/:id/state-history", getMinerStateHistory);
 
 export default router;
