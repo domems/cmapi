@@ -42,12 +42,13 @@ function parseIntIdOr400(req, res) {
   return num;
 }
 
+// src/controllers/minersController.js
 const TAG = "[MINER-STATE-HISTORY]";
 const ALLOWED_STATES = new Set(["ONLINE","OFFLINE","MAINTENANCE","STALE"]);
 
 export async function getMinerStateHistory(req, res) {
   try {
-    const minerId = Number(req.params.id);
+    const minerId = Number(req.params.id || NaN);
     const rawLimit = Number(req.query.limit || 50);
     const limit = Math.max(1, Math.min(rawLimit, 200));
 
@@ -59,8 +60,8 @@ export async function getMinerStateHistory(req, res) {
       SELECT
         id,
         miner_id,
-        from_state,
-        to_state,
+        UPPER(from_state) AS from_state,
+        UPPER(to_state)   AS to_state,
         slot_iso,
         occurred_at_utc,
         reason
@@ -70,19 +71,26 @@ export async function getMinerStateHistory(req, res) {
       LIMIT ${limit};
     `;
 
-    // aceitar from_state NULL, validar to_state
-    const safe = rows.filter(r =>
-      ALLOWED_STATES.has((r.to_state || "").toUpperCase()) &&
-      (r.from_state == null || ALLOWED_STATES.has((r.from_state || "").toUpperCase()))
+    const safe = (rows || []).filter(r =>
+      ALLOWED_STATES.has(r.to_state || "") &&
+      (r.from_state == null || ALLOWED_STATES.has(r.from_state || ""))
     );
 
-    console.log(TAG, { minerId, got: rows.length, safe: safe.length });
-    return res.status(200).json({ items: safe }); // <- SEMPRE 200
+    console.log(TAG, { minerId, rows: rows?.length ?? -1, safe: safe.length });
+
+    // Prova de que ESTE handler respondeu
+    res.setHeader("x-debug-route", "miners/:id/state-history");
+    res.setHeader("x-debug-miner-id", String(minerId));
+    res.setHeader("cache-control", "no-store");
+
+    // NUNCA 204 — mesmo vazia devolve []
+    return res.status(200).json({ items: safe });
   } catch (e) {
     try { console.error(TAG, e); } catch {}
     return res.status(500).json({ error: "failed to fetch miner state history" });
   }
 }
+
 
 
 
