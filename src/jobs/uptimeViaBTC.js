@@ -1,7 +1,12 @@
 // src/jobs/uptimeViaBTC.js
 import cron from "node-cron";
-import fetch from "node-fetch";
+import fetchOrig from "node-fetch";
 import { sql } from "../config/db.js";
+
+/* =============================== */
+/* Utils gerais                    */
+/* =============================== */
+const fetch = globalThis.fetch || fetchOrig;
 
 function slotISO(d = new Date()) {
   const m = d.getUTCMinutes();
@@ -21,6 +26,7 @@ const tail = (s) => {
 };
 function normalizeCoin(c) {
   const s = String(c ?? "").trim().toUpperCase();
+  // Mantendo a tua restrição original; se quiseres outras, adiciona aqui.
   return s === "BTC" || s === "LTC" ? s : "";
 }
 /** estado online sem falsos positivos (ex.: "unactive" NÃO é "active") */
@@ -35,8 +41,12 @@ function isOnlineFrom(w) {
   return false;
 }
 
-// ===== API fetch + caches =====
+/* =============================== */
+/* API fetch + caches              */
+/* =============================== */
 const API_TTL_MS = 60_000; // cache em memória por grupo (api_key|coin)
+const API_TIMEOUT_MS = 12_000;
+
 const apiCache = new Map(); // key -> { workers, ts }
 let lastSlot = null;
 let slotCache = new Map();  // `${slot}|${api_key}|${coin}` -> workers
@@ -51,20 +61,35 @@ function beginSlot(s) {
 }
 function dedupe(ids) {
   const out = [];
-  for (const id of ids) if (!updatedInSlot.has(id)) { updatedInSlot.add(id); out.push(id); }
+  for (const id of ids) {
+    if (!updatedInSlot.has(id)) {
+      updatedInSlot.add(id);
+      out.push(id);
+    }
+  }
   return out;
 }
 
 async function fetchViaBTCList(apiKey, coin) {
   const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}`;
-  const resp = await fetch(url, { headers: { "X-API-KEY": apiKey } });
-  const data = await resp.json().catch(() => null);
-  if (!data || data.code !== 0 || !Array.isArray(data.data?.data)) return [];
-  return data.data.data.map((w) => ({
-    worker_name: String(w.worker_name ?? ""),
-    worker_status: String(w.worker_status ?? ""),
-    hashrate_10min: Number(w.hashrate_10min ?? 0),
-  }));
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), API_TIMEOUT_MS);
+  try {
+    const resp = await fetch(url, {
+      headers: { "X-API-KEY": apiKey },
+      signal: ac.signal,
+    });
+    // ViaBTC costuma devolver 200 mesmo com erro de conteúdo; valida sempre JSON
+    const data = await resp.json().catch(() => null);
+    if (!data || data.code !== 0 || !Array.isArray(data.data?.data)) return [];
+    return data.data.data.map((w) => ({
+      worker_name: String(w.worker_name ?? ""),
+      worker_status: String(w.worker_status ?? ""),
+      hashrate_10min: Number(w.hashrate_10min ?? 0),
+    }));
+  } finally {
+    clearTimeout(to);
+  }
 }
 
 /**
@@ -99,7 +124,9 @@ async function getViaBTCWorkersCached(apiKey, coin, slot) {
 /* ===== Bloqueio manutenção (status DB) ===== */
 const IS_NOT_MAINT = sql`AND lower(COALESCE(status, '')) <> 'maintenance'`;
 
-// ===== Job principal =====
+/* =============================== */
+/* Job principal                   */
+/* =============================== */
 export async function runUptimeViaBTCOnce() {
   const t0 = Date.now();
   const sISO = slotISO();
@@ -113,13 +140,14 @@ export async function runUptimeViaBTCOnce() {
   let groupErrors = 0;
   let apiCalls = 0;
 
-  // novos contadores de alterações de status
+  // contadores de alterações de status
   let statusToOnline = 0;
   let statusToOffline = 0;
 
-  // limitar concorrência para não bombardear a API
+  // concorrência REAL
   const CONCURRENCY = 3;
-  const queue = [];
+  const inflight = new Set();
+  const allTasks = [];
 
   try {
     // agrupar por (api_key, coin normalizada)
@@ -138,7 +166,7 @@ export async function runUptimeViaBTCOnce() {
       return { ok: true, updated: 0 };
     }
 
-    const groups = new Map(); // `${api_key}|/${coin}` -> Miner[]
+    const groups = new Map(); // `${api_key}|${coin}` -> Miner[]
     for (const m of miners) {
       const k = `${m.api_key}|${m.coin}`;
       if (!groups.has(k)) groups.set(k, []);
@@ -148,7 +176,7 @@ export async function runUptimeViaBTCOnce() {
 
     const groupEntries = Array.from(groups.entries());
 
-    async function processGroup([k, list]) {
+    const processGroup = async ([k, list]) => {
       const [apiKey, coin] = k.split("|");
 
       try {
@@ -212,7 +240,7 @@ export async function runUptimeViaBTCOnce() {
               ${IS_NOT_MAINT}
             RETURNING id
           `;
-          statusToOnline += (Array.isArray(r1) ? r1.length : (r1?.count || 0));
+          statusToOnline += Array.isArray(r1) ? r1.length : (r1?.count || 0);
         }
         if (offlineIdsRaw.length) {
           const r2 = await sql/*sql*/`
@@ -223,23 +251,29 @@ export async function runUptimeViaBTCOnce() {
               ${IS_NOT_MAINT}
             RETURNING id
           `;
-          statusToOffline += (Array.isArray(r2) ? r2.length : (r2?.count || 0));
+          statusToOffline += Array.isArray(r2) ? r2.length : (r2?.count || 0);
         }
-      } catch {
+      } catch (err) {
         groupErrors += 1;
+        console.error(`[uptime:viabtc] group error ${k}:`, err?.message || err);
+      }
+    };
+
+    // Pool de concorrência
+    for (const entry of groupEntries) {
+      const task = (async () => await processGroup(entry))();
+      allTasks.push(task);
+      inflight.add(task);
+      task.finally(() => inflight.delete(task));
+
+      if (inflight.size >= CONCURRENCY) {
+        // Espera uma terminar antes de lançar mais
+        await Promise.race(inflight).catch(() => {});
       }
     }
 
-    // executa com concorrência limitada (mantido como no teu código)
-    for (const entry of groupEntries) {
-      const p = processGroup(entry);
-      queue.push(p);
-      if (queue.length >= CONCURRENCY) {
-        await Promise.race(queue).catch(() => {});
-        // mantido: não mexi na tua fila; se quiseres eu limpo resolvidos depois.
-      }
-    }
-    await Promise.allSettled(queue);
+    // Espera tudo fechar
+    await Promise.allSettled(allTasks);
 
     console.log(
       `[uptime:viabtc] ${sISO} groups=${totalGroups} miners=${totalMiners} api=${apiCalls} workers=${workersRelevant} extra=${workersExtra} online(+hrs)=${updated} statusOn=${statusToOnline} statusOff=${statusToOffline} errs=${groupErrors} dur=${Date.now() - t0}ms`
@@ -263,11 +297,14 @@ export async function runUptimeViaBTCOnce() {
   }
 }
 
+/* =============================== */
+/* Scheduler                       */
+/* =============================== */
 export function startUptimeViaBTC() {
   cron.schedule(
     "*/15 * * * *",
     async () => {
-      try { await runUptimeViaBTCOnce(); } catch {}
+      try { await runUptimeViaBTCOnce(); } catch (e) { console.error("[uptime:viabtc] tick error:", e?.message || e); }
     },
     { timezone: "Europe/Lisbon" }
   );
