@@ -986,7 +986,7 @@ router.get("/users/:userId/invoices/flags", async (req, res) => {
     res.json({
       user_id: userId,
       oldest_unsettled_days,
-      has_overdue_5d: typeof oldest_unsettled_days === "number" ? oldest_unsettled_days > 5 : false,
+      has_overdue_5d: typeof oldest_unsettled_days === "number" ? oldest_unsettled_days > 4 : false,
     });
   } catch (e) {
     error("GET /users/:userId/invoices/flags", e?.message || e);
@@ -1043,7 +1043,7 @@ router.get("/invoices/flags", async (req, res) => {
       return {
         user_id: String(r.user_id),
         oldest_unsettled_days: d,
-        has_overdue_5d: typeof d === "number" ? d > 5 : false,
+        has_overdue_5d: typeof d === "number" ? d > 4 : false,
       };
     });
 
