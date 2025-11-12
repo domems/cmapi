@@ -187,13 +187,27 @@ async function fetchMinerStatusNormalized(minerId, preloaded) {
   let rec = preloaded;
   if (!rec) {
     const rows = await sql`
-      SELECT id, api_key, secret_key, coin, pool, worker_name
+      SELECT id, api_key, secret_key, coin, pool, worker_name, status
       FROM miners
       WHERE id::text = ${String(minerId)}
       LIMIT 1
     `;
     if (!rows.length) return { id: String(minerId), error: "not_found" };
     rec = rows[0];
+  }
+
+  // 🔧 CURTO-CIRCUITO: se o miner está marcado em manutenção na DB, não chama nenhuma pool
+  const dbStatus = String(rec.status ?? "").trim().toLowerCase();
+  if (dbStatus === "maintenance") {
+    return {
+      id: String(minerId),
+      worker_status: "maintenance",
+      hashrate_10min: 0,
+      power: null,
+      watts: null,
+      source: null,
+      worker_found: false,
+    };
   }
 
   const { api_key, secret_key, coin, pool } = rec;
@@ -491,7 +505,7 @@ export async function getMinersStatusMany(req, res) {
   try {
     // 3) ir ao DB buscar TODOS de uma vez
     const rows = await sql`
-      SELECT id, api_key, secret_key, coin, pool, worker_name
+      SELECT id, api_key, secret_key, coin, pool, worker_name, status
       FROM miners
       WHERE id::text = ANY(${toFetch})
     `;
