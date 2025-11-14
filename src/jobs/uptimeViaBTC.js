@@ -99,6 +99,33 @@ function dedupe(ids) {
   return out;
 }
 
+/* ===== Public IP logging (com cache) ===== */
+
+const PUBLIC_IP_TTL_MS = 10 * 60 * 1000; // 10 minutos
+let lastPublicIpCheck = 0;
+let lastPublicIp = null;
+
+async function getPublicIp() {
+  const now = Date.now();
+  if (lastPublicIp && now - lastPublicIpCheck < PUBLIC_IP_TTL_MS) {
+    return lastPublicIp;
+  }
+
+  try {
+    const resp = await fetch("https://api.ipify.org?format=json");
+    const data = await resp.json().catch(() => null);
+    const ip = data?.ip || null;
+    lastPublicIp = ip;
+    lastPublicIpCheck = now;
+    dlog("PUBLIC IP DETECTED", { ip });
+    return ip;
+  } catch (e) {
+    console.error(TAG, "PUBLIC IP ERROR", e?.message || e);
+    lastPublicIpCheck = now;
+    return null;
+  }
+}
+
 /* ===== backoff genérico ===== */
 async function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -123,6 +150,18 @@ async function fetchViaBTCListOnce(apiKey, coin) {
   const url = `https://www.viabtc.net/res/openapi/v1/hashrate/worker?coin=${coin}`;
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), API_TIMEOUT_MS);
+
+  // LOG do IP público antes de chamar a ViaBTC (com cache para não spammar)
+  try {
+    const ip = await getPublicIp();
+    if (ip) {
+      dlog("OUTBOUND IP (via ipify)", { ip });
+    } else {
+      dlog("OUTBOUND IP (via ipify)", { ip: null });
+    }
+  } catch {
+    // já foi logado no getPublicIp se der erro
+  }
 
   dlog("FETCH BEGIN", {
     url,
