@@ -1,9 +1,4 @@
 // src/jobs/index.js
-import { startUptimeViaBTC } from "./uptimeViaBTC.js";
-import { startUptimeLTCPool } from "./uptimeLiteCoinPool.js";
-import { startUptimeBinance } from "./uptimeBinance.js";
-import { startUptimeF2Pool } from "./uptimeF2Pool.js";
-import { startUptimeMiningDutch } from "./uptimeMiningDutch.js";
 import { startDeliverPushLoop } from "./deliverPush.js";
 import { startDetectStateLoop } from "./detectState.js";
 import { startInvoiceLate5dLoop } from "./invoiceLate5d.js";
@@ -33,13 +28,6 @@ export function startAllJobs() {
   started = true;
 
   console.log("🚀 Iniciando todos os jobs...");
-
-  /* ---------- UPTIME DETECTION ---------- */
-  safeStart("ViaBTC uptime", startUptimeViaBTC);
-  safeStart("LitecoinPool uptime", startUptimeLTCPool);
-  safeStart("Binance uptime", startUptimeBinance);
-  safeStart("F2Pool uptime", startUptimeF2Pool);
-  safeStart("MiningDutch uptime", startUptimeMiningDutch);
 
   /* ---------- BILLING / INVOICES ---------- */
   import("./monthlyClose.js")
