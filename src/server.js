@@ -201,25 +201,6 @@ app.use((err, req, res, _next) => {
 /* ================= DB bootstrap ================= */
 async function initDB() {
   try {
-    // pgcrypto (melhor esforço)
-    try {
-      await sql/*sql*/`CREATE EXTENSION IF NOT EXISTS pgcrypto;`;
-    } catch (e) {
-      console.warn("⚠️ pgcrypto skipped:", e?.message || e);
-    }
-
-    // tabela de IPNs (se não existir)
-    await sql/*sql*/`
-      CREATE TABLE IF NOT EXISTS payments_ipn (
-        id BIGSERIAL PRIMARY KEY,
-        provider TEXT NOT NULL,
-        external_id TEXT NOT NULL UNIQUE,
-        payload JSONB NOT NULL,
-        received_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-
-    // (se quiseres, cria aqui índices adicionais ou outras tabelas)
     logger.info("✅ DB pronta.");
   } catch (err) {
     console.error("❌ Erro ao preparar a DB:", err);
