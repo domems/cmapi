@@ -10,27 +10,22 @@ if (!CLERK_SECRET_KEY) {
   console.warn("[staffUsersController] Missing CLERK_SECRET_KEY env var");
 }
 
-/* ===== Tabela sombra (locked + role para fallback visual) =====
-   — Neon não aceita multi-statements preparados
-   — Pode existir TYPE órfão (mesmo nome) a bloquear CREATE TABLE
-   — Usa advisory lock para evitar race entre lambdas
-*/
+/* ===== Tabela sombra (locked + role para fallback visual) ===== */
 let _flagsInitDone = false;
 const LOCK_KEY = 684_221_337; // qualquer BIGINT estável
 
 async function ensureFlagsTableOnce() {
   if (_flagsInitDone) return;
 
-  // lock global (processo concorrente? espera)
-  try { await sql/*sql*/`SELECT pg_advisory_lock(${LOCK_KEY}::bigint)`; } catch {}
+  try {
+    await sql/*sql*/`SELECT pg_advisory_lock(${LOCK_KEY}::bigint)`;
+  } catch {}
 
   try {
-    // já existe?
     const existsRes = await sql/*sql*/`SELECT to_regclass('public.clerk_user_flags') AS rel`;
     const rel = existsRes?.[0]?.rel;
 
     if (!rel) {
-      // remove TYPE órfão que impede CREATE TABLE (no-op se não existir)
       await sql/*sql*/`DO $$
       BEGIN
         IF EXISTS (SELECT 1 FROM pg_type t
@@ -57,7 +52,9 @@ async function ensureFlagsTableOnce() {
 
     _flagsInitDone = true;
   } finally {
-    try { await sql/*sql*/`SELECT pg_advisory_unlock(${LOCK_KEY}::bigint)`; } catch {}
+    try {
+      await sql/*sql*/`SELECT pg_advisory_unlock(${LOCK_KEY}::bigint)`;
+    } catch {}
   }
 }
 
@@ -124,7 +121,6 @@ function tsToIso(v) {
   if (v == null) return null;
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return null;
-  // Heurística: < 1e11 é segundos (até ~2033). Clerk envia em ms.
   const ms = n < 1e11 ? n * 1000 : n;
   const d = new Date(ms);
   if (isNaN(d.getTime())) return null;
@@ -139,56 +135,49 @@ function primaryEmailFromClerkUser(u) {
     const hit = list.find(e => e?.id === primaryId);
     if (hit?.email_address) return hit.email_address;
   }
-  // fallback: first email
   return list[0]?.email_address || "";
 }
 
-/** Converte o user do Clerk para o payload da app, preservando admin/staff/user e datas em ISO verdadeiras. */
-function toSafeUser(u, lockedMap) {
+/** Converte o user do Clerk para o payload da app, incluindo has_miners. */
+function toSafeUser(u, lockedMap, minersMap) {
   const email = primaryEmailFromClerkUser(u);
   const name = [u.first_name, u.last_name].filter(Boolean).join(" ") || null;
 
-  // Clerk envia timestamps em MILLIseconds (mas blindamos seg->ms)
   const created_at   = tsToIso(u?.created_at);
   const last_active  = tsToIso(u?.last_active_at);
   const last_sign_in = tsToIso(u?.last_sign_in_at);
   const updated_at   = tsToIso(u?.updated_at);
 
-  // invited = nunca teve atividade (sem last_active_at e sem last_sign_in_at)
-  const isInvited = !u?.last_active_at && !u?.last_sign_in_at;
-
-  // suspended = ban/locked do Clerk (estado administrativo no provider)
   const clerkSuspended = !!(u?.banned || u?.locked);
-
-  // locked local (tabela sombra) vence sobre tudo
   const locked = !!lockedMap.get(u.id);
+  const has_miners = !!(minersMap && minersMap.get(u.id));
 
   const meta_role_raw = String(u?.public_metadata?.role ?? "").toLowerCase();
   const meta_role =
     meta_role_raw === "admin" ? "admin" :
     meta_role_raw === "staff" ? "staff" : "user";
 
-  // Para a UI base, só "staff" | "user". Admin é um flag separado.
   const role = meta_role === "staff" ? "staff" : "user";
   const is_admin = meta_role === "admin";
 
   let status = "active";
   if (locked) status = "locked";
   else if (clerkSuspended) status = "suspended";
-  else if (isInvited) status = "invited";
+  else if (!has_miners) status = "invited";
+  else status = "active";
 
   return {
     id: u.id,
     email,
     name,
-    role,                 // "user" | "staff" (compat com UI)
-    meta_role,            // "user" | "staff" | "admin"
-    is_admin,             // boolean
-    status,               // "locked" | "suspended" | "invited" | "active"
-    created_at,           // ISO verdadeiro
-    // “Melhor esforço” para last activity visível em UI:
+    role,
+    meta_role,
+    is_admin,
+    status,
+    created_at,
     last_active_at: last_active || last_sign_in || updated_at || null,
     locked,
+    has_miners,
   };
 }
 
@@ -206,18 +195,121 @@ export async function listStaffUsers(req, res) {
     const orderParam = String(req.query.order || "-created_at");
     const order_by = orderParam.startsWith("-") ? "-created_at" : "created_at";
 
+    const isEmailSearch = qRaw && looksLikeEmail(qRaw);
+
+    /* ========= Pesquisas NÃO-email: global search em cima de todas as páginas ========= */
+    if (qRaw && !isEmailSearch) {
+      const searchCap = clamp(req.query.searchLimit ?? 1000, 1, 5000);
+      const clerkPageSize = 100;
+
+      let matches = [];
+      let clerkOffset = 0;
+      let totalClerk = null;
+
+      try {
+        while (matches.length < searchCap) {
+          const sp = new URLSearchParams();
+          sp.set("limit", String(clerkPageSize));
+          sp.set("offset", String(clerkOffset));
+
+          const dataPage = await clerkFetch(`/users?${sp.toString()}`);
+          const usersPage = Array.isArray(dataPage?.data)
+            ? dataPage.data
+            : Array.isArray(dataPage)
+              ? dataPage
+              : [];
+
+          if (!usersPage.length) break;
+
+          clerkOffset += usersPage.length;
+          if (totalClerk == null) {
+            totalClerk = Number(dataPage?.total_count ?? 0) || null;
+          }
+
+          for (const u of usersPage) {
+            const email = primaryEmailFromClerkUser(u).toLowerCase();
+            const name = [u.first_name, u.last_name].filter(Boolean).join(" ").toLowerCase();
+            const id = String(u.id || "").toLowerCase();
+            if (
+              (name && name.includes(q)) ||
+              (email && email.includes(q)) ||
+              (id && id.includes(q))
+            ) {
+              matches.push(u);
+              if (matches.length >= searchCap) break;
+            }
+          }
+
+          if (totalClerk && clerkOffset >= totalClerk) break;
+        }
+      } catch (e) {
+        if (e && e.message === "RATE_LIMIT") {
+          res.setHeader("Retry-After", String(e.retryAfter));
+          return res.status(429).json({ error: "rate_limited", retry_after: e.retryAfter, reqId });
+        }
+        if (e && (e.status === 401 || e.status === 403)) {
+          const payload = isProd
+            ? { error: "clerk_auth_failed", reqId }
+            : { error: "clerk_auth_failed", reqId, detail: e.message };
+          return res.status(502).json(payload);
+        }
+        const payload = isProd
+          ? { error: "clerk_error", reqId }
+          : { error: "clerk_error", reqId, detail: e.message };
+        return res.status(502).json(payload);
+      }
+
+      const totalMatches = matches.length;
+      const slice = matches.slice(offset, offset + pageSize);
+      const ids = slice.map((u) => u.id);
+
+      const lockedRows = ids.length
+        ? await sql/*sql*/`
+            SELECT user_id, locked, role
+            FROM public.clerk_user_flags
+            WHERE user_id = ANY(${ids})
+          `
+        : [];
+      const minersRows = ids.length
+        ? await sql/*sql*/`
+            SELECT DISTINCT user_id
+            FROM public.miners
+            WHERE user_id = ANY(${ids})
+          `
+        : [];
+
+      const lockedMap = new Map(lockedRows.map((r) => [r.user_id, r.locked]));
+      const minersMap = new Map(minersRows.map((r) => [r.user_id, true]));
+
+      let items = slice.map((u) => toSafeUser(u, lockedMap, minersMap));
+
+      if (order_by === "-created_at") {
+        items.sort((a, b) => {
+          const ta = a.created_at ? +new Date(a.created_at) : 0;
+          const tb = b.created_at ? +new Date(b.created_at) : 0;
+          return tb - ta;
+        });
+      } else {
+        items.sort((a, b) => {
+          const ta = a.created_at ? +new Date(a.created_at) : 0;
+          const tb = b.created_at ? +new Date(b.created_at) : 0;
+          return ta - tb;
+        });
+      }
+
+      return res.json({ items, total: totalMatches, pageSize, offset, reqId });
+    }
+
+    /* ========= Listagem normal e pesquisa por email exato ========= */
     const params = new URLSearchParams();
     params.set("limit", String(pageSize));
     params.set("offset", String(offset));
-    // Se pesquisa por email exato, deixa o Clerk filtrar
-    if (qRaw && looksLikeEmail(qRaw)) {
+    if (isEmailSearch) {
       params.append("email_address", qRaw);
     }
-    // NOTA: para nome/ID, tens de filtrar localmente (já fazemos)
 
     let data;
     try {
-      // Clerk: /users devolve { data: [...], total_count, ... } (dependendo da versão)
       data = await clerkFetch(`/users?${params.toString()}`);
     } catch (e) {
       if (e && e.message === "RATE_LIMIT") {
@@ -241,24 +333,28 @@ export async function listStaffUsers(req, res) {
 
     const ids = users.map((u) => u.id);
     const lockedRows = ids.length
-      ? await sql/*sql*/`SELECT user_id, locked, role FROM public.clerk_user_flags WHERE user_id = ANY(${ids})`
+      ? await sql/*sql*/`
+          SELECT user_id, locked, role
+          FROM public.clerk_user_flags
+          WHERE user_id = ANY(${ids})
+        `
       : [];
+    const minersRows = ids.length
+      ? await sql/*sql*/`
+          SELECT DISTINCT user_id
+          FROM public.miners
+          WHERE user_id = ANY(${ids})
+        `
+      : [];
+
     const lockedMap = new Map(lockedRows.map((r) => [r.user_id, r.locked]));
+    const minersMap = new Map(minersRows.map((r) => [r.user_id, true]));
 
-    let items = users.map((u) => toSafeUser(u, lockedMap));
+    let items = users.map((u) => toSafeUser(u, lockedMap, minersMap));
 
-    // pesquisa local por nome/email/id quando não é email exato
-    if (qRaw && !looksLikeEmail(qRaw)) {
-      const ql = q;
-      items = items.filter(
-        (it) =>
-          (it.name || "").toLowerCase().includes(ql) ||
-          (it.email || "").toLowerCase().includes(ql) ||
-          (it.id || "").toLowerCase().includes(ql)
-      );
-    }
+    // se qRaw não é email: já tratámos acima; aqui só pode ser "", ou email exato
+    // portanto não há filtro local extra (Clerk já filtrou por email_address)
 
-    // order local por created_at
     if (order_by === "-created_at") {
       items.sort((a, b) => {
         const ta = a.created_at ? +new Date(a.created_at) : 0;
