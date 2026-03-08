@@ -158,7 +158,7 @@ app.use(rateLimiter);
 // públicas/gerais
 app.use("/api/clerk", requireAuth(), adminOrStaffOnly, clerkRoutes);
 app.use("/api", statusRoutes);
-app.use("/api", requireAuth(), adminOrStaffOnly, storeMinersRoutes);
+app.use("/api", storeMinersRoutes);
 
 // Payments normal (create-intent, intent, sync, qr)
 app.use("/api", paymentsRoutes);
