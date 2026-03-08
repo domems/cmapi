@@ -51,6 +51,38 @@ function toHours(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 }
+function normalizeOfflineDays(input) {
+  let arr = Array.isArray(input) ? input : [];
+  if (!arr.length && typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input);
+      if (Array.isArray(parsed)) arr = parsed;
+    } catch {}
+  }
+  return arr
+    .map((d) => ({
+      day_utc: String(d?.day_utc || "").trim(),
+      offline_hours: Number(toHours(d?.offline_hours).toFixed(2)),
+    }))
+    .filter((d) => d.day_utc && d.offline_hours > 0)
+    .sort((a, b) => b.offline_hours - a.offline_hours || a.day_utc.localeCompare(b.day_utc));
+}
+function normalizeHotHours(input) {
+  let arr = Array.isArray(input) ? input : [];
+  if (!arr.length && typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input);
+      if (Array.isArray(parsed)) arr = parsed;
+    } catch {}
+  }
+  return arr
+    .map((h) => ({
+      hour_utc: Number.parseInt(String(h?.hour_utc ?? ""), 10),
+      offline_hours: Number(toHours(h?.offline_hours).toFixed(2)),
+    }))
+    .filter((h) => Number.isFinite(h.hour_utc) && h.hour_utc >= 0 && h.hour_utc <= 23 && h.offline_hours > 0)
+    .sort((a, b) => b.offline_hours - a.offline_hours || a.hour_utc - b.hour_utc);
+}
 function mapOfflineRowsToUsers(rows) {
   const byUser = new Map();
   for (const r of rows || []) {
@@ -68,6 +100,8 @@ function mapOfflineRowsToUsers(rows) {
       worker_name: r.worker_name || `Miner #${String(r.miner_id)}`,
       offline_hours: Number(offlineHours.toFixed(2)),
       offline_intervals: Number(r.offline_intervals || 0),
+      offline_days: normalizeOfflineDays(r.offline_days),
+      hot_hours_utc: normalizeHotHours(r.hot_hours_utc),
     };
 
     if (!byUser.has(userId)) {
@@ -78,12 +112,23 @@ function mapOfflineRowsToUsers(rows) {
         offline_hours: 0,
         offline_miners: 0,
         miners: [],
+        _dayMap: new Map(),
+        _hourMap: new Map(),
       });
     }
     const bucket = byUser.get(userId);
     bucket.miners.push(miner);
     bucket.offline_hours += miner.offline_hours;
     bucket.offline_miners += 1;
+    for (const d of miner.offline_days) {
+      const prev = toHours(bucket._dayMap.get(d.day_utc));
+      bucket._dayMap.set(d.day_utc, Number((prev + d.offline_hours).toFixed(2)));
+    }
+    for (const h of miner.hot_hours_utc) {
+      const key = String(h.hour_utc);
+      const prev = toHours(bucket._hourMap.get(key));
+      bucket._hourMap.set(key, Number((prev + h.offline_hours).toFixed(2)));
+    }
   }
 
   return Array.from(byUser.values())
@@ -91,7 +136,24 @@ function mapOfflineRowsToUsers(rows) {
       ...u,
       offline_hours: Number(u.offline_hours.toFixed(2)),
       miners: u.miners.sort((a, b) => b.offline_hours - a.offline_hours),
+      critical_days: Array.from(u._dayMap.entries())
+        .map(([day_utc, offline_hours]) => ({ day_utc, offline_hours: Number(toHours(offline_hours).toFixed(2)) }))
+        .filter((d) => d.offline_hours > 0)
+        .sort((a, b) => b.offline_hours - a.offline_hours || a.day_utc.localeCompare(b.day_utc))
+        .slice(0, 5),
+      critical_hours_utc: Array.from(u._hourMap.entries())
+        .map(([hour_utc, offline_hours]) => ({
+          hour_utc: Number.parseInt(hour_utc, 10),
+          offline_hours: Number(toHours(offline_hours).toFixed(2)),
+        }))
+        .filter((h) => Number.isFinite(h.hour_utc) && h.offline_hours > 0)
+        .sort((a, b) => b.offline_hours - a.offline_hours || a.hour_utc - b.hour_utc)
+        .slice(0, 6),
     }))
+    .map((u) => {
+      const { _dayMap, _hourMap, ...safe } = u;
+      return safe;
+    })
     .sort((a, b) => b.offline_hours - a.offline_hours);
 }
 
@@ -524,12 +586,107 @@ export async function offlineSummaryByMonth(req, res) {
           FROM ranked_points rp
           JOIN month_bounds b ON true
           WHERE COALESCE(rp.next_ts, b.month_end) > rp.ts
+        ),
+        offline_segments AS (
+          SELECT
+            s.miner_id,
+            s.started_at,
+            s.ended_at
+          FROM segments s
+          WHERE s.state = 'OFFLINE'
+            AND s.ended_at > s.started_at
+        ),
+        offline_day_slices AS (
+          SELECT
+            os.miner_id,
+            gs.day_start::date AS day_utc,
+            EXTRACT(
+              EPOCH FROM (
+                LEAST(os.ended_at, gs.day_start + INTERVAL '1 day')
+                - GREATEST(os.started_at, gs.day_start)
+              )
+            )::double precision AS slice_seconds
+          FROM offline_segments os
+          JOIN LATERAL generate_series(
+            date_trunc('day', os.started_at),
+            date_trunc('day', os.ended_at - INTERVAL '1 second'),
+            INTERVAL '1 day'
+          ) AS gs(day_start) ON true
+        ),
+        offline_day_totals AS (
+          SELECT
+            miner_id,
+            day_utc,
+            SUM(slice_seconds)::double precision AS offline_seconds
+          FROM offline_day_slices
+          WHERE slice_seconds > 0
+          GROUP BY miner_id, day_utc
+        ),
+        offline_days_json AS (
+          SELECT
+            miner_id,
+            COALESCE(
+              jsonb_agg(
+                jsonb_build_object(
+                  'day_utc', to_char(day_utc, 'YYYY-MM-DD'),
+                  'offline_hours', ROUND((offline_seconds / 3600.0)::numeric, 2)
+                )
+                ORDER BY offline_seconds DESC, day_utc ASC
+              ),
+              '[]'::jsonb
+            ) AS offline_days
+          FROM offline_day_totals
+          GROUP BY miner_id
+        ),
+        offline_hour_slices AS (
+          SELECT
+            os.miner_id,
+            EXTRACT(HOUR FROM gs.hour_start)::int AS hour_utc,
+            EXTRACT(
+              EPOCH FROM (
+                LEAST(os.ended_at, gs.hour_start + INTERVAL '1 hour')
+                - GREATEST(os.started_at, gs.hour_start)
+              )
+            )::double precision AS slice_seconds
+          FROM offline_segments os
+          JOIN LATERAL generate_series(
+            date_trunc('hour', os.started_at),
+            date_trunc('hour', os.ended_at - INTERVAL '1 second'),
+            INTERVAL '1 hour'
+          ) AS gs(hour_start) ON true
+        ),
+        offline_hour_totals AS (
+          SELECT
+            miner_id,
+            hour_utc,
+            SUM(slice_seconds)::double precision AS offline_seconds
+          FROM offline_hour_slices
+          WHERE slice_seconds > 0
+          GROUP BY miner_id, hour_utc
+        ),
+        offline_hours_json AS (
+          SELECT
+            miner_id,
+            COALESCE(
+              jsonb_agg(
+                jsonb_build_object(
+                  'hour_utc', hour_utc,
+                  'offline_hours', ROUND((offline_seconds / 3600.0)::numeric, 2)
+                )
+                ORDER BY offline_seconds DESC, hour_utc ASC
+              ),
+              '[]'::jsonb
+            ) AS hot_hours_utc
+          FROM offline_hour_totals
+          GROUP BY miner_id
         )
         SELECT
           ms.user_id,
           ms.miner_id,
           COALESCE(ms.worker_name, CONCAT_WS(' ', ms.nome, ms.modelo), CONCAT('Miner #', ms.miner_id::text)) AS worker_name,
           COUNT(*) FILTER (WHERE s.state = 'OFFLINE')::int AS offline_intervals,
+          COALESCE(dj.offline_days, '[]'::jsonb) AS offline_days,
+          COALESCE(hj.hot_hours_utc, '[]'::jsonb) AS hot_hours_utc,
           COALESCE(
             SUM(
               CASE
@@ -542,7 +699,9 @@ export async function offlineSummaryByMonth(req, res) {
           )::double precision AS offline_seconds
         FROM miners_scope ms
         LEFT JOIN segments s ON s.miner_id = ms.miner_id
-        GROUP BY ms.user_id, ms.miner_id, worker_name
+        LEFT JOIN offline_days_json dj ON dj.miner_id = ms.miner_id
+        LEFT JOIN offline_hours_json hj ON hj.miner_id = ms.miner_id
+        GROUP BY ms.user_id, ms.miner_id, worker_name, dj.offline_days, hj.hot_hours_utc
         HAVING COALESCE(
           SUM(
             CASE
