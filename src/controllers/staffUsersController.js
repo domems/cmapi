@@ -401,7 +401,16 @@ export async function listStaffUsers(req, res) {
       const paged = items.slice(offset, offset + pageSize);
       const scanCapped = candidates.length >= searchCap && (!totalClerk || clerkOffset < totalClerk);
 
-      return res.json({ items: paged, total: totalMatches, pageSize, offset, reqId, scan_capped: scanCapped });
+      const hasMore = offset + paged.length < totalMatches;
+      return res.json({
+        items: paged,
+        total: totalMatches,
+        has_more: hasMore,
+        pageSize,
+        offset,
+        reqId,
+        scan_capped: scanCapped,
+      });
     }
 
     /* ========= Listagem normal e pesquisa por email exato ========= */
@@ -433,7 +442,8 @@ export async function listStaffUsers(req, res) {
     }
 
     const users = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : [];
-    const total = Number(data?.total_count ?? (Array.isArray(users) ? users.length : 0));
+    const totalBody = Number(data?.total_count);
+    const total = Number.isFinite(totalBody) && totalBody >= 0 ? totalBody : null;
 
     const ids = users.map((u) => u.id);
     const lockedRows = ids.length
@@ -467,7 +477,19 @@ export async function listStaffUsers(req, res) {
     items = applySearchAndFilter(items, { q, filter });
     items = sortByCreated(items, order_by);
 
-    return res.json({ items, total: filter === "all" ? total : items.length, pageSize, offset, reqId });
+    const effectiveTotal = filter === "all" ? total : items.length;
+    const hasMore =
+      typeof effectiveTotal === "number"
+        ? offset + items.length < effectiveTotal
+        : items.length >= pageSize;
+    return res.json({
+      items,
+      total: effectiveTotal,
+      has_more: hasMore,
+      pageSize,
+      offset,
+      reqId,
+    });
   } catch (err) {
     console.error(`[staff.listStaffUsers] reqId=${reqId}`, err);
     const payload = isProd
