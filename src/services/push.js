@@ -23,22 +23,26 @@ export async function upsertPushToken({ userId, token, platform, appVersion, dev
 }
 
 /** Heartbeat para manter last_seen fresco */
-export async function heartbeatPush({ token, deviceId }) {
-  if (!token) return;
+export async function heartbeatPush({ userId, token, deviceId }) {
+  if (!token || !userId) return;
   await sql/*sql*/`
     UPDATE push_tokens
        SET last_seen = now(), updated_at = now()
-     WHERE token = ${token} AND (device_id IS NULL OR device_id = ${deviceId ?? null})
+     WHERE user_id = ${userId}
+       AND token = ${token}
+       AND (device_id IS NULL OR device_id = ${deviceId ?? null})
   `;
 }
 
 /** Marca como revogado (logout/perms off) */
-export async function unregisterPush({ token, deviceId }) {
-  if (!token) return;
+export async function unregisterPush({ userId, token, deviceId }) {
+  if (!token || !userId) return;
   await sql/*sql*/`
     UPDATE push_tokens
        SET status='revoked', updated_at=now()
-     WHERE token=${token} AND (device_id IS NULL OR device_id=${deviceId ?? null})
+     WHERE user_id=${userId}
+       AND token=${token}
+       AND (device_id IS NULL OR device_id=${deviceId ?? null})
   `;
 }
 

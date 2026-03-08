@@ -440,13 +440,16 @@ router.post("/invoices/close-now", async (req, res) => {
 /* ===================== GET /api/invoices/status ===================== */
 router.get("/invoices/status", async (req, res) => {
   try {
+    const userId = pickUserId(req);
+    if (!userId) return res.status(401).json({ error: "unauthorized" });
+
     const invoiceId = Number(req.query.invoiceId);
     if (!invoiceId) return res.status(400).json({ error: "invoiceId em falta" });
 
     const [inv] = await sql/*sql*/`
       SELECT id, status, subtotal_amount
       FROM energy_invoices
-      WHERE id = ${invoiceId}
+      WHERE id = ${invoiceId} AND user_id = ${userId}
       LIMIT 1
     `;
     if (!inv) return res.status(404).json({ error: "Fatura não encontrada" });

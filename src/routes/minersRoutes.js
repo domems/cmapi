@@ -11,6 +11,7 @@ const router = express.Router();
 
 // 1º: histórico
 router.get("/state/:id/state-history", getMinerStateHistory);
+router.get("/:id/state-history", getMinerStateHistory); // compat legado
 
 // 2º: update cliente
 router.put("/cliente/:id", atualizarMinerComoCliente);

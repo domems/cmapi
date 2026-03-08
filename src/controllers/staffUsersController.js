@@ -75,6 +75,10 @@ function parsePaging(req) {
 function norm(s) { return String(s ?? "").trim(); }
 function looksLikeEmail(s) { return /\S+@\S+\.\S+/.test(s); }
 function genReqId() { return Math.random().toString(36).slice(2) + Date.now().toString(36); }
+function truthyFlag(v) {
+  const s = String(v ?? "").trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
 
 async function clerkFetch(path, init = {}) {
   if (!CLERK_SECRET_KEY) {
@@ -181,6 +185,46 @@ function toSafeUser(u, lockedMap, minersMap) {
   };
 }
 
+async function attachInvoiceFlags(items) {
+  const userIds = items.map((u) => String(u.id || "")).filter(Boolean);
+  if (!userIds.length) return items;
+
+  const rows = await sql/*sql*/`
+    WITH base AS (
+      SELECT user_id::text, MIN(created_at) AS oldest_unsettled_created_at
+      FROM public.energy_invoices
+      WHERE status NOT IN ('pago','cancelado')
+        AND user_id = ANY(${userIds})
+      GROUP BY user_id
+    )
+    SELECT
+      user_id,
+      FLOOR(EXTRACT(EPOCH FROM (NOW() - oldest_unsettled_created_at)) / 86400)::int AS oldest_unsettled_days
+    FROM base
+  `;
+
+  const flagsByUserId = new Map();
+  for (const r of rows) {
+    const days = r.oldest_unsettled_days == null ? null : Number(r.oldest_unsettled_days);
+    flagsByUserId.set(String(r.user_id), {
+      oldest_unsettled_days: days,
+      has_overdue_5d: typeof days === "number" ? days > 4 : false,
+    });
+  }
+
+  return items.map((u) => {
+    const f = flagsByUserId.get(u.id);
+    if (!f) {
+      return {
+        ...u,
+        oldest_unsettled_days: null,
+        has_overdue_5d: false,
+      };
+    }
+    return { ...u, ...f };
+  });
+}
+
 /* ===== GET /staff/users ===== */
 export async function listStaffUsers(req, res) {
   const reqId = genReqId();
@@ -194,12 +238,13 @@ export async function listStaffUsers(req, res) {
     const q = qRaw.toLowerCase();
     const orderParam = String(req.query.order || "-created_at");
     const order_by = orderParam.startsWith("-") ? "-created_at" : "created_at";
+    const withInvoiceFlags = truthyFlag(req.query.withInvoiceFlags);
 
     const isEmailSearch = qRaw && looksLikeEmail(qRaw);
 
     /* ========= Pesquisas NÃO-email: global search em cima de todas as páginas ========= */
     if (qRaw && !isEmailSearch) {
-      const searchCap = clamp(req.query.searchLimit ?? 1000, 1, 5000);
+      const searchCap = clamp(req.query.searchLimit ?? 300, 1, 1000);
       const clerkPageSize = 100;
 
       let matches = [];
@@ -282,6 +327,13 @@ export async function listStaffUsers(req, res) {
       const minersMap = new Map(minersRows.map((r) => [r.user_id, true]));
 
       let items = slice.map((u) => toSafeUser(u, lockedMap, minersMap));
+      if (withInvoiceFlags && items.length) {
+        try {
+          items = await attachInvoiceFlags(items);
+        } catch (e) {
+          console.warn(`[staff.listStaffUsers] reqId=${reqId} attachInvoiceFlags(search) failed`, e?.message || e);
+        }
+      }
 
       if (order_by === "-created_at") {
         items.sort((a, b) => {
@@ -351,6 +403,13 @@ export async function listStaffUsers(req, res) {
     const minersMap = new Map(minersRows.map((r) => [r.user_id, true]));
 
     let items = users.map((u) => toSafeUser(u, lockedMap, minersMap));
+    if (withInvoiceFlags && items.length) {
+      try {
+        items = await attachInvoiceFlags(items);
+      } catch (e) {
+        console.warn(`[staff.listStaffUsers] reqId=${reqId} attachInvoiceFlags(list) failed`, e?.message || e);
+      }
+    }
 
     // se qRaw não é email: já tratámos acima; aqui só pode ser "", ou email exato
     // portanto não há filtro local extra (Clerk já filtrou por email_address)
@@ -451,6 +510,11 @@ export async function lockUser(req, res) {
     const userId = String(req.params.id || "");
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
 
+    await clerkFetch(`/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ banned: true }),
+    });
+
     await sql/*sql*/`
       INSERT INTO public.clerk_user_flags (user_id, role, locked)
       VALUES (${userId}, 'user', TRUE)
@@ -475,6 +539,11 @@ export async function unlockUser(req, res) {
     await ensureFlagsTableOnce();
     const userId = String(req.params.id || "");
     if (!userId) return res.status(400).json({ error: "missing_user_id", reqId });
+
+    await clerkFetch(`/users/${encodeURIComponent(userId)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ banned: false }),
+    });
 
     await sql/*sql*/`
       INSERT INTO public.clerk_user_flags (user_id, role, locked)

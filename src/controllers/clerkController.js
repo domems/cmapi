@@ -3,10 +3,11 @@ import dotenv from "dotenv";
 dotenv.config();
 
 export const getUserIdByEmail = async (req, res) => {
-  const { email } = req.params;
+  const email = String(req.params.email || "").trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: "Email em falta" });
 
   try {
-    const url = `https://api.clerk.dev/v1/users?email_address=${email}`;
+    const url = `https://api.clerk.com/v1/users?email_address=${encodeURIComponent(email)}`;
     const response = await fetch(url, {
       headers: {
         Authorization: `Bearer ${process.env.CLERK_SECRET_KEY}`,

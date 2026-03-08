@@ -51,9 +51,26 @@ export async function getMinerStateHistory(req, res) {
     const minerId = Number(req.params.id || NaN);
     const rawLimit = Number(req.query.limit || 50);
     const limit = Math.max(1, Math.min(rawLimit, 200));
+    const requesterId = String(req.userId || req.auth?.userId || "");
 
     if (!Number.isInteger(minerId)) {
       return res.status(400).json({ error: "invalid miner id" });
+    }
+    if (!requesterId) {
+      return res.status(401).json({ error: "unauthorized" });
+    }
+
+    const [owner] = await sql/*sql*/`
+      SELECT user_id
+      FROM miners
+      WHERE id = ${minerId}
+      LIMIT 1
+    `;
+    if (!owner) {
+      return res.status(404).json({ error: "miner not found" });
+    }
+    if (String(owner.user_id) !== requesterId) {
+      return res.status(403).json({ error: "forbidden" });
     }
 
     const rows = await sql/*sql*/`
@@ -99,6 +116,8 @@ export async function getMinerStateHistory(req, res) {
 export const atualizarMinerComoCliente = async (req, res) => {
   const id = parseIntIdOr400(req, res);
   if (id === null) return;
+  const requesterId = String(req.userId || req.auth?.userId || "");
+  if (!requesterId) return res.status(401).json({ error: "unauthorized" });
 
   const { worker_name, api_key, secret_key, coin, pool } = req.body || {};
 
@@ -110,6 +129,9 @@ export const atualizarMinerComoCliente = async (req, res) => {
       LIMIT 1
     `;
     if (!curr) return res.status(404).json({ error: "Miner não encontrada." });
+    if (String(curr.user_id) !== requesterId) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     if (curr.locked === true) {
       return res.status(423).json({ error: "Registo bloqueado pelo admin (locked=true)." });
     }
@@ -147,10 +169,15 @@ export const atualizarMinerComoCliente = async (req, res) => {
 export const obterMinerPorId = async (req, res) => {
   const id = parseIntIdOr400(req, res);
   if (id === null) return;
+  const requesterId = String(req.userId || req.auth?.userId || "");
+  if (!requesterId) return res.status(401).json({ error: "unauthorized" });
 
   try {
     const [miner] = await sql/*sql*/`SELECT * FROM miners WHERE id = ${id}`;
     if (!miner) return res.status(404).json({ error: "Mineradora não encontrada" });
+    if (String(miner.user_id) !== requesterId) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
     res.json(miner);
   } catch (err) {
     console.error("Erro ao buscar miner:", err);
@@ -189,5 +216,4 @@ export const listarMinersPorUser = async (req, res) => {
     res.status(500).json({ error: "Erro ao buscar miners" });
   }
 };
-
 

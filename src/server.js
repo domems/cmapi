@@ -151,9 +151,9 @@ app.get(
 app.use(rateLimiter);
 
 // públicas/gerais
-app.use("/api/clerk", clerkRoutes);
+app.use("/api/clerk", requireAuth(), adminOrStaffOnly, clerkRoutes);
 app.use("/api", statusRoutes);
-app.use("/api", storeMinersRoutes);
+app.use("/api", requireAuth(), adminOrStaffOnly, storeMinersRoutes);
 
 // Payments normal (create-intent, intent, sync, qr)
 app.use("/api", paymentsRoutes);
@@ -209,13 +209,19 @@ async function initDB() {
 }
 
 /* ================= Arranque ================= */
-initDB().then(() => {
-  const server = app.listen(PORT, () => {
-    logger.info(`HTTP listening on :${PORT}`);
-    startAllJobs();
-  });
+const isVercelRuntime = process.env.VERCEL === "1";
 
-  // timeouts para travar slowloris
-  server.headersTimeout = 65_000;
-  server.requestTimeout = 60_000;
-});
+if (!isVercelRuntime) {
+  initDB().then(() => {
+    const server = app.listen(PORT, () => {
+      logger.info(`HTTP listening on :${PORT}`);
+      startAllJobs();
+    });
+
+    // timeouts para travar slowloris
+    server.headersTimeout = 65_000;
+    server.requestTimeout = 60_000;
+  });
+}
+
+export default app;

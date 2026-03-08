@@ -1,7 +1,7 @@
 // NO RENDER – novo statusController.js (simples)
 import fetch from "node-fetch";
 
-const WORKER_BASE = process.env.WORKER_STATUS_BASE || "http://109.123.252.103:4000";
+const WORKER_BASE = process.env.WORKER_STATUS_BASE || "http://127.0.0.1:4000";
 
 export async function getMinerStatus(req, res) {
   const { id } = req.params;
