@@ -10,6 +10,7 @@ import {
   obterStatusBatch,
   obterStatusPorId,
   listarMinerStateEvents,
+  offlineSummaryByMonth,
 } from "../controllers/staffController.js";
 
 import {
@@ -50,6 +51,7 @@ router.get("/miners/:id/status", obterStatusPorId);
 
 /* ---------- Timeline de eventos de estado ---------- */
 router.get("/miner-state-events", listarMinerStateEvents);
+router.get("/offline-summary", offlineSummaryByMonth);
 
 /* ---------- Gestão de utilizadores (staff/admin) ---------- */
 router.get("/users", listStaffUsers);

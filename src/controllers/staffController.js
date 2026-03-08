@@ -1,4 +1,5 @@
 import { sql } from "../config/db.js";
+import { getClerkUserById } from "../services/clerkUserService.js";
 
 /* ---------- Utils ---------- */
 function parsePaging(req) {
@@ -23,6 +24,28 @@ function numFromText(v) {
 }
 function norm(s) {
   return String(s ?? "").trim().toLowerCase();
+}
+function clampInt(v, min, max, fallback) {
+  const n = Number.parseInt(String(v ?? ""), 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+function pickPrimaryEmailFromClerkUser(user) {
+  const arr = Array.isArray(user?.email_addresses) ? user.email_addresses : [];
+  const primaryId = user?.primary_email_address_id || null;
+  if (primaryId) {
+    const hit = arr.find((e) => e?.id === primaryId);
+    if (hit?.email_address) return String(hit.email_address).toLowerCase();
+  }
+  return arr[0]?.email_address ? String(arr[0].email_address).toLowerCase() : null;
+}
+function userDisplayFromClerk(user) {
+  if (!user || typeof user !== "object") return { name: null, email: null };
+  const first = String(user.first_name || "").trim();
+  const last = String(user.last_name || "").trim();
+  const name = [first, last].filter(Boolean).join(" ").trim() || user.username || null;
+  const email = pickPrimaryEmailFromClerkUser(user);
+  return { name: name || null, email: email || null };
 }
 
 /* ---------- Health ---------- */
@@ -353,5 +376,195 @@ export async function listarMinerStateEvents(req, res) {
   } catch (err) {
     console.error("staff.listarMinerStateEvents:", err);
     res.status(500).json({ error: "Erro ao listar eventos." });
+  }
+}
+
+/* ---------- Resumo mensal de offline por user/miner ---------- */
+export async function offlineSummaryByMonth(req, res) {
+  try {
+    const now = new Date();
+    const year = clampInt(req.query.year, 2000, 2100, now.getUTCFullYear());
+    const month = clampInt(req.query.month, 1, 12, now.getUTCMonth() + 1);
+
+    const startUtc = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
+    const endUtc = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
+    if (!(startUtc < endUtc)) {
+      return res.status(400).json({ error: "invalid_month_range" });
+    }
+
+    const perMiner = await sql/*sql*/`
+      WITH month_bounds AS (
+        SELECT ${startUtc.toISOString()}::timestamptz AS month_start,
+               ${endUtc.toISOString()}::timestamptz AS month_end
+      ),
+      miners_scope AS (
+        SELECT
+          m.id AS miner_id,
+          m.user_id::text AS user_id,
+          NULLIF(TRIM(COALESCE(m.worker_name, '')), '') AS worker_name,
+          NULLIF(TRIM(COALESCE(m.nome, '')), '') AS nome,
+          NULLIF(TRIM(COALESCE(m.modelo, '')), '') AS modelo
+        FROM miners m
+      ),
+      prev_event_state AS (
+        SELECT DISTINCT ON (e.miner_id)
+          e.miner_id,
+          UPPER(e.to_state) AS state
+        FROM miner_state_events e
+        JOIN month_bounds b ON true
+        WHERE e.occurred_at_utc < b.month_start
+        ORDER BY e.miner_id, e.occurred_at_utc DESC, e.id DESC
+      ),
+      prev_stable_state AS (
+        SELECT
+          s.miner_id,
+          UPPER(s.current_state) AS state
+        FROM miner_state s
+        JOIN month_bounds b ON true
+        WHERE s.stable_since_utc <= b.month_start
+      ),
+      initial_points AS (
+        SELECT
+          ms.miner_id,
+          b.month_start AS ts,
+          COALESCE(pe.state, ps.state, 'ONLINE') AS state
+        FROM miners_scope ms
+        JOIN month_bounds b ON true
+        LEFT JOIN prev_event_state pe ON pe.miner_id = ms.miner_id
+        LEFT JOIN prev_stable_state ps ON ps.miner_id = ms.miner_id
+      ),
+      event_points AS (
+        SELECT
+          e.miner_id,
+          e.occurred_at_utc AS ts,
+          UPPER(e.to_state) AS state
+        FROM miner_state_events e
+        JOIN month_bounds b ON true
+        WHERE e.occurred_at_utc >= b.month_start
+          AND e.occurred_at_utc < b.month_end
+      ),
+      timeline_points AS (
+        SELECT miner_id, ts, state FROM initial_points
+        UNION ALL
+        SELECT miner_id, ts, state FROM event_points
+      ),
+      ranked_points AS (
+        SELECT
+          p.miner_id,
+          p.ts,
+          p.state,
+          LEAD(p.ts) OVER (PARTITION BY p.miner_id ORDER BY p.ts ASC) AS next_ts
+        FROM timeline_points p
+      ),
+      segments AS (
+        SELECT
+          rp.miner_id,
+          rp.state,
+          rp.ts AS started_at,
+          COALESCE(rp.next_ts, b.month_end) AS ended_at
+        FROM ranked_points rp
+        JOIN month_bounds b ON true
+        WHERE COALESCE(rp.next_ts, b.month_end) > rp.ts
+      )
+      SELECT
+        ms.user_id,
+        ms.miner_id,
+        COALESCE(ms.worker_name, CONCAT_WS(' ', ms.nome, ms.modelo), CONCAT('Miner #', ms.miner_id::text)) AS worker_name,
+        COUNT(*) FILTER (WHERE s.state = 'OFFLINE')::int AS offline_intervals,
+        COALESCE(
+          SUM(
+            CASE
+              WHEN s.state = 'OFFLINE'
+                THEN EXTRACT(EPOCH FROM (s.ended_at - s.started_at))
+              ELSE 0
+            END
+          ),
+          0
+        )::double precision AS offline_seconds
+      FROM miners_scope ms
+      LEFT JOIN segments s ON s.miner_id = ms.miner_id
+      GROUP BY ms.user_id, ms.miner_id, worker_name
+      HAVING COALESCE(
+        SUM(
+          CASE
+            WHEN s.state = 'OFFLINE'
+              THEN EXTRACT(EPOCH FROM (s.ended_at - s.started_at))
+            ELSE 0
+          END
+        ),
+        0
+      ) > 0
+      ORDER BY offline_seconds DESC, ms.miner_id ASC
+    `;
+
+    const byUser = new Map();
+    for (const r of perMiner || []) {
+      const userId = String(r.user_id || "");
+      if (!userId) continue;
+      const offlineSeconds = Number(r.offline_seconds || 0);
+      const offlineHours = offlineSeconds / 3600;
+      const miner = {
+        miner_id: Number(r.miner_id),
+        worker_name: r.worker_name || `Miner #${String(r.miner_id)}`,
+        offline_hours: Number(offlineHours.toFixed(2)),
+        offline_intervals: Number(r.offline_intervals || 0),
+      };
+      if (!byUser.has(userId)) {
+        byUser.set(userId, {
+          user_id: userId,
+          name: null,
+          email: null,
+          offline_hours: 0,
+          offline_miners: 0,
+          miners: [],
+        });
+      }
+      const bucket = byUser.get(userId);
+      bucket.miners.push(miner);
+      bucket.offline_hours += miner.offline_hours;
+      bucket.offline_miners += 1;
+    }
+
+    const users = Array.from(byUser.values())
+      .map((u) => ({
+        ...u,
+        offline_hours: Number(u.offline_hours.toFixed(2)),
+        miners: u.miners.sort((a, b) => b.offline_hours - a.offline_hours),
+      }))
+      .sort((a, b) => b.offline_hours - a.offline_hours);
+
+    await Promise.allSettled(
+      users.map(async (u) => {
+        try {
+          const clerkUser = await getClerkUserById(u.user_id);
+          const profile = userDisplayFromClerk(clerkUser);
+          u.name = profile.name;
+          u.email = profile.email;
+        } catch {
+          // Keep user_id as fallback when Clerk lookup fails.
+        }
+      })
+    );
+
+    const totalOfflineHours = users.reduce((acc, u) => acc + Number(u.offline_hours || 0), 0);
+    const totalOfflineMiners = users.reduce((acc, u) => acc + Number(u.offline_miners || 0), 0);
+
+    return res.json({
+      period: {
+        year,
+        month,
+        start_utc: startUtc.toISOString(),
+        end_utc: endUtc.toISOString(),
+      },
+      totals: {
+        users: users.length,
+        miners: totalOfflineMiners,
+        offline_hours: Number(totalOfflineHours.toFixed(2)),
+      },
+      users,
+    });
+  } catch (err) {
+    console.error("staff.offlineSummaryByMonth:", err);
+    return res.status(500).json({ error: "failed_offline_summary" });
   }
 }
