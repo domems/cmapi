@@ -85,6 +85,145 @@ function allowReveal(req) {
   return role === "staff" || role === "admin";
 }
 
+let _hoursAuditInitDone = false;
+const HOURS_AUDIT_LOCK_KEY = 684_221_389;
+
+async function ensureHoursAuditTableOnce() {
+  if (_hoursAuditInitDone) return;
+  try {
+    await sql/*sql*/`SELECT pg_advisory_lock(${HOURS_AUDIT_LOCK_KEY}::bigint)`;
+  } catch {}
+
+  try {
+    await sql/*sql*/`
+      CREATE TABLE IF NOT EXISTS miner_hours_adjustments_audit (
+        id BIGSERIAL PRIMARY KEY,
+        miner_id BIGINT NOT NULL,
+        miner_name TEXT,
+        target_user_id TEXT NOT NULL,
+        staff_user_id TEXT NOT NULL,
+        staff_role TEXT,
+        hours_before NUMERIC(12,3),
+        hours_after NUMERIC(12,3),
+        hours_delta NUMERIC(12,3),
+        request_ip TEXT,
+        request_id TEXT,
+        reason TEXT,
+        changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `;
+    await sql/*sql*/`
+      CREATE INDEX IF NOT EXISTS idx_mhaa_target_time
+      ON miner_hours_adjustments_audit (target_user_id, changed_at DESC)
+    `;
+    await sql/*sql*/`
+      CREATE INDEX IF NOT EXISTS idx_mhaa_miner_time
+      ON miner_hours_adjustments_audit (miner_id, changed_at DESC)
+    `;
+    _hoursAuditInitDone = true;
+  } finally {
+    try {
+      await sql/*sql*/`SELECT pg_advisory_unlock(${HOURS_AUDIT_LOCK_KEY}::bigint)`;
+    } catch {}
+  }
+}
+
+function asFiniteNumberOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function hoursChanged(before, after) {
+  if (before === null && after === null) return false;
+  if (before === null || after === null) return true;
+  return Math.abs(before - after) > 1e-9;
+}
+
+function toFixed3(v) {
+  const n = asFiniteNumberOrNull(v);
+  if (n === null) return null;
+  return Number(n.toFixed(3));
+}
+
+function fmtHours(v) {
+  const n = asFiniteNumberOrNull(v);
+  if (n === null) return "0";
+  return n.toFixed(2);
+}
+
+async function logManualHoursAdjustment({
+  minerId,
+  minerName,
+  targetUserId,
+  staffUserId,
+  staffRole,
+  hoursBefore,
+  hoursAfter,
+  requestIp,
+  requestId,
+  reason,
+}) {
+  await ensureHoursAuditTableOnce();
+  const delta = (hoursAfter ?? 0) - (hoursBefore ?? 0);
+
+  const [auditRow] = await sql/*sql*/`
+    INSERT INTO miner_hours_adjustments_audit (
+      miner_id, miner_name, target_user_id, staff_user_id, staff_role,
+      hours_before, hours_after, hours_delta,
+      request_ip, request_id, reason
+    ) VALUES (
+      ${minerId},
+      ${minerName || null},
+      ${targetUserId},
+      ${staffUserId || "unknown"},
+      ${staffRole || null},
+      ${toFixed3(hoursBefore)},
+      ${toFixed3(hoursAfter)},
+      ${toFixed3(delta)},
+      ${requestIp || null},
+      ${requestId || null},
+      ${reason || null}
+    )
+    RETURNING id, changed_at
+  `;
+
+  const auditId = auditRow?.id;
+  const changedAt = auditRow?.changed_at || new Date().toISOString();
+  const title = "Horas online ajustadas";
+  const body = `A equipa ajustou ${minerName || `miner #${minerId}`} de ${fmtHours(hoursBefore)}h para ${fmtHours(hoursAfter)}h.`;
+
+  await sql/*sql*/`
+    INSERT INTO notification_outbox (
+      dedupe_key, audience_kind, audience_ref, channel, template, payload_json, status, send_after_utc
+    ) VALUES (
+      ${`miner_hours_adjusted:${auditId || `${minerId}:${Date.now()}`}:inapp`},
+      'user',
+      ${targetUserId},
+      'inapp',
+      'miner_hours_adjusted',
+      ${JSON.stringify({
+        title,
+        body,
+        data: {
+          audit_id: auditId ?? null,
+          miner_id: minerId,
+          miner_name: minerName || null,
+          changed_by_staff_user_id: staffUserId || null,
+          staff_role: staffRole || null,
+          hours_before: toFixed3(hoursBefore),
+          hours_after: toFixed3(hoursAfter),
+          hours_delta: toFixed3(delta),
+          changed_at: changedAt,
+        },
+      })}::jsonb,
+      'sent',
+      NOW()
+    )
+    ON CONFLICT (dedupe_key) DO NOTHING
+  `;
+}
+
 /* ====== Invoice Status Helpers (PT storage) ====== */
 const PT_STATUS = new Set(["pendente", "pago", "cancelado", "em_curso"]);
 
@@ -334,10 +473,16 @@ router.patch("/miners/:id", async (req, res) => {
     pool,
     locked,
     total_horas_online,
+    adjustment_reason,
   } = req.body || {};
 
   try {
-    const [before] = await sql/*sql*/`SELECT user_id FROM miners WHERE id = ${id} LIMIT 1`;
+    const [before] = await sql/*sql*/`
+      SELECT id, user_id, nome, total_horas_online
+      FROM miners
+      WHERE id = ${id}
+      LIMIT 1
+    `;
     if (!before) return res.status(404).json({ error: "Miner não encontrada." });
 
     let hashRateNum, precoKwNum, consumoNum, hoursNum, statusVal, poolVal;
@@ -381,10 +526,73 @@ router.patch("/miners/:id", async (req, res) => {
     invalidateUserList(oldUser);
     if (newUser !== oldUser) invalidateUserList(newUser);
 
+    const beforeHours = asFiniteNumberOrNull(before.total_horas_online);
+    const afterHours = asFiniteNumberOrNull(updated.total_horas_online);
+    const shouldAuditHours =
+      total_horas_online !== undefined && hoursChanged(beforeHours, afterHours);
+
+    if (shouldAuditHours) {
+      try {
+        await logManualHoursAdjustment({
+          minerId: Number(updated.id),
+          minerName: String(updated.nome || before.nome || ""),
+          targetUserId: String(updated.user_id || before.user_id || ""),
+          staffUserId: String(req.auth?.userId || ""),
+          staffRole: String(req.userRole || getRoleLoose(req) || ""),
+          hoursBefore: beforeHours,
+          hoursAfter: afterHours,
+          requestIp: String(req.ip || req.headers["x-forwarded-for"] || ""),
+          requestId: String(req.headers["x-request-id"] || ""),
+          reason: adjustment_reason ? String(adjustment_reason).slice(0, 300) : null,
+        });
+      } catch (auditErr) {
+        warn("PATCH /miners/:id audit warn:", auditErr?.message || auditErr);
+      }
+    }
+
     res.json(updated);
   } catch (e) {
     error("PATCH /miners/:id", e?.message || e);
     res.status(500).json({ error: "Erro ao atualizar miner" });
+  }
+});
+
+/**
+ * GET /api/staff/users/:userId/miners/hours-audit
+ * Query: ?limit=50&before_id=123&minerId=10
+ */
+router.get("/users/:userId/miners/hours-audit", async (req, res) => {
+  const userId = String(req.params.userId || "").trim();
+  if (!userId) return res.status(400).json({ error: "userId em falta" });
+
+  try {
+    await ensureHoursAuditTableOnce();
+    const limitRaw = Number.parseInt(String(req.query.limit ?? 50), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(100, limitRaw)) : 50;
+
+    const beforeIdRaw = Number.parseInt(String(req.query.before_id ?? ""), 10);
+    const beforeId = Number.isFinite(beforeIdRaw) ? beforeIdRaw : null;
+
+    const minerIdRaw = Number.parseInt(String(req.query.minerId ?? ""), 10);
+    const minerId = Number.isFinite(minerIdRaw) ? minerIdRaw : null;
+
+    const rows = await sql/*sql*/`
+      SELECT
+        id, miner_id, miner_name, target_user_id, staff_user_id, staff_role,
+        hours_before, hours_after, hours_delta, reason, changed_at
+      FROM miner_hours_adjustments_audit
+      WHERE target_user_id = ${userId}
+        ${beforeId ? sql`AND id < ${beforeId}` : sql``}
+        ${minerId ? sql`AND miner_id = ${minerId}` : sql``}
+      ORDER BY id DESC
+      LIMIT ${limit}
+    `;
+
+    const next_before_id = rows.length === limit ? rows[rows.length - 1]?.id ?? null : null;
+    return res.json({ items: rows, next_before_id });
+  } catch (e) {
+    error("GET /users/:userId/miners/hours-audit", e?.message || e);
+    return res.status(500).json({ error: "Erro ao carregar auditoria das horas online" });
   }
 });
 
