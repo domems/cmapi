@@ -41,6 +41,10 @@ const ORIGINS = (process.env.CORS_ORIGINS || "")
 
 const app = express();
 
+function authUserId(req) {
+  return String(req.auth?.userId || req.auth?.sessionClaims?.sub || "").trim();
+}
+
 /* ================= Segurança base ================= */
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
@@ -135,15 +139,16 @@ const minersListLimiter = rateLimit({
 app.get(
   "/api/miners/user/:userId",
   requireAuth(),
-  preListCache(),
-  minersListLimiter,
   (req, res, next) => {
     // bloqueio cross-tenant
     const param = String(req.params.userId);
-    const uid = req.auth?.userId;
+    const uid = authUserId(req);
     if (!uid || uid !== param) return res.status(403).json({ error: "Forbidden" });
-    return listarMinersPorUser(req, res, next);
-  }
+    return next();
+  },
+  preListCache(),
+  minersListLimiter,
+  listarMinersPorUser
 );
 
 /* ================= Middlewares/rotas do resto da app ================= */
@@ -160,7 +165,7 @@ app.use("/api", paymentsRoutes);
 
 // rotas com auth do utilizador
 function userScope(req, _res, next) {
-  const uid = req.auth?.userId;
+  const uid = authUserId(req);
   if (!uid) return next(new Error("Missing auth"));
   req.userId = uid;
   next();
