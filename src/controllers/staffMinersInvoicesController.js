@@ -576,12 +576,43 @@ router.get("/users/:userId/miners/hours-audit", async (req, res) => {
     const minerIdRaw = Number.parseInt(String(req.query.minerId ?? ""), 10);
     const minerId = Number.isFinite(minerIdRaw) ? minerIdRaw : null;
 
+    const yearRaw = Number.parseInt(String(req.query.year ?? ""), 10);
+    const monthRaw = Number.parseInt(String(req.query.month ?? ""), 10);
+
+    let year = Number.isFinite(yearRaw) ? yearRaw : null;
+    let month = Number.isFinite(monthRaw) ? monthRaw : null;
+
+    if ((year != null && month == null) || (year == null && month != null)) {
+      return res.status(400).json({ error: "year e month devem ser enviados em conjunto." });
+    }
+
+    if (year != null && month != null) {
+      if (year < 2000 || year > 2100) {
+        return res.status(400).json({ error: "year inválido." });
+      }
+      if (month < 1 || month > 12) {
+        return res.status(400).json({ error: "month inválido (1..12)." });
+      }
+    }
+
+    if (year == null || month == null) {
+      const [curr] = await sql/*sql*/`
+        SELECT
+          EXTRACT(YEAR FROM (NOW() AT TIME ZONE 'Europe/Lisbon'))::int AS year,
+          EXTRACT(MONTH FROM (NOW() AT TIME ZONE 'Europe/Lisbon'))::int AS month
+      `;
+      year = Number(curr?.year);
+      month = Number(curr?.month);
+    }
+
     const rows = await sql/*sql*/`
       SELECT
         id, miner_id, miner_name, target_user_id, staff_user_id, staff_role,
         hours_before, hours_after, hours_delta, reason, changed_at
       FROM miner_hours_adjustments_audit
       WHERE target_user_id = ${userId}
+        AND changed_at >= make_timestamptz(${year}, ${month}, 1, 0, 0, 0, 'Europe/Lisbon')
+        AND changed_at <  (make_timestamptz(${year}, ${month}, 1, 0, 0, 0, 'Europe/Lisbon') + INTERVAL '1 month')
         ${beforeId ? sql`AND id < ${beforeId}` : sql``}
         ${minerId ? sql`AND miner_id = ${minerId}` : sql``}
       ORDER BY id DESC
@@ -589,7 +620,7 @@ router.get("/users/:userId/miners/hours-audit", async (req, res) => {
     `;
 
     const next_before_id = rows.length === limit ? rows[rows.length - 1]?.id ?? null : null;
-    return res.json({ items: rows, next_before_id });
+    return res.json({ items: rows, next_before_id, year, month });
   } catch (e) {
     error("GET /users/:userId/miners/hours-audit", e?.message || e);
     return res.status(500).json({ error: "Erro ao carregar auditoria das horas online" });
