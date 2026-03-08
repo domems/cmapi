@@ -81,6 +81,9 @@ function truthyFlag(v) {
 }
 function normalizeFilter(v) {
   const raw = String(v ?? "all").trim().toLowerCase();
+  if (raw === "overdue" || raw === "unpaid" || raw === "por_pagar") {
+    return "overdue5";
+  }
   switch (raw) {
     case "all":
     case "active":
@@ -103,9 +106,14 @@ function matchesFilter(u, filter) {
   if (filter === "role:user") return u?.role === "user" && !u?.is_admin;
   if (filter === "active") return !!u?.has_miners;
   if (filter === "invited") return !u?.has_miners;
-  if (filter === "overdue5") {
+  if (
+    filter === "overdue5" ||
+    filter === "overdue" ||
+    filter === "unpaid" ||
+    filter === "por_pagar"
+  ) {
     if (u?.has_overdue_5d) return true;
-    return typeof u?.oldest_unsettled_days === "number" && u.oldest_unsettled_days > 4;
+    return typeof u?.oldest_unsettled_days === "number" && u.oldest_unsettled_days >= 0;
   }
   const s = u?.locked ? "locked" : String(u?.status || "");
   return s === filter;
@@ -266,7 +274,7 @@ async function attachInvoiceFlags(items) {
     const days = r.oldest_unsettled_days == null ? null : Number(r.oldest_unsettled_days);
     flagsByUserId.set(String(r.user_id), {
       oldest_unsettled_days: days,
-      has_overdue_5d: typeof days === "number" ? days > 4 : false,
+      has_overdue_5d: typeof days === "number" ? days >= 0 : false,
     });
   }
 
