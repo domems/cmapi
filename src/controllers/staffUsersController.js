@@ -79,6 +79,64 @@ function truthyFlag(v) {
   const s = String(v ?? "").trim().toLowerCase();
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
+function normalizeFilter(v) {
+  const raw = String(v ?? "all").trim().toLowerCase();
+  switch (raw) {
+    case "all":
+    case "active":
+    case "invited":
+    case "locked":
+    case "suspended":
+    case "role:admin":
+    case "role:staff":
+    case "role:user":
+    case "overdue5":
+      return raw;
+    default:
+      return "all";
+  }
+}
+function matchesFilter(u, filter) {
+  if (filter === "all") return true;
+  if (filter === "role:admin") return !!u?.is_admin;
+  if (filter === "role:staff") return u?.role === "staff" && !u?.is_admin;
+  if (filter === "role:user") return u?.role === "user" && !u?.is_admin;
+  if (filter === "active") return !!u?.has_miners;
+  if (filter === "invited") return !u?.has_miners;
+  if (filter === "overdue5") {
+    if (u?.has_overdue_5d) return true;
+    return typeof u?.oldest_unsettled_days === "number" && u.oldest_unsettled_days > 4;
+  }
+  const s = u?.locked ? "locked" : String(u?.status || "");
+  return s === filter;
+}
+function applySearchAndFilter(items, { q, filter }) {
+  return items.filter((u) => {
+    if (filter !== "all" && !matchesFilter(u, filter)) return false;
+    if (!q) return true;
+    const name = String(u?.name || "").toLowerCase();
+    const email = String(u?.email || "").toLowerCase();
+    const id = String(u?.id || "").toLowerCase();
+    return name.includes(q) || email.includes(q) || id.includes(q);
+  });
+}
+function sortByCreated(items, order_by) {
+  const out = [...items];
+  if (order_by === "-created_at") {
+    out.sort((a, b) => {
+      const ta = a.created_at ? +new Date(a.created_at) : 0;
+      const tb = b.created_at ? +new Date(b.created_at) : 0;
+      return tb - ta;
+    });
+  } else {
+    out.sort((a, b) => {
+      const ta = a.created_at ? +new Date(a.created_at) : 0;
+      const tb = b.created_at ? +new Date(b.created_at) : 0;
+      return ta - tb;
+    });
+  }
+  return out;
+}
 
 async function clerkFetch(path, init = {}) {
   if (!CLERK_SECRET_KEY) {
@@ -238,21 +296,24 @@ export async function listStaffUsers(req, res) {
     const q = qRaw.toLowerCase();
     const orderParam = String(req.query.order || "-created_at");
     const order_by = orderParam.startsWith("-") ? "-created_at" : "created_at";
+    const filter = normalizeFilter(req.query.filter);
     const withInvoiceFlags = truthyFlag(req.query.withInvoiceFlags);
+    const needsInvoiceFlags = withInvoiceFlags || filter === "overdue5";
 
     const isEmailSearch = qRaw && looksLikeEmail(qRaw);
+    const needsGlobalScan = (qRaw && !isEmailSearch) || (filter !== "all" && !isEmailSearch);
 
-    /* ========= Pesquisas NÃO-email: global search em cima de todas as páginas ========= */
-    if (qRaw && !isEmailSearch) {
-      const searchCap = clamp(req.query.searchLimit ?? 300, 1, 1000);
+    /* ========= Pesquisa/filtro global ========= */
+    if (needsGlobalScan) {
+      const searchCap = clamp(req.query.searchLimit ?? 2000, 100, 5000);
       const clerkPageSize = 100;
 
-      let matches = [];
+      let candidates = [];
       let clerkOffset = 0;
       let totalClerk = null;
 
       try {
-        while (matches.length < searchCap) {
+        while (candidates.length < searchCap) {
           const sp = new URLSearchParams();
           sp.set("limit", String(clerkPageSize));
           sp.set("offset", String(clerkOffset));
@@ -272,17 +333,18 @@ export async function listStaffUsers(req, res) {
           }
 
           for (const u of usersPage) {
-            const email = primaryEmailFromClerkUser(u).toLowerCase();
-            const name = [u.first_name, u.last_name].filter(Boolean).join(" ").toLowerCase();
-            const id = String(u.id || "").toLowerCase();
-            if (
-              (name && name.includes(q)) ||
-              (email && email.includes(q)) ||
-              (id && id.includes(q))
-            ) {
-              matches.push(u);
-              if (matches.length >= searchCap) break;
+            if (qRaw && !isEmailSearch) {
+              const email = primaryEmailFromClerkUser(u).toLowerCase();
+              const name = [u.first_name, u.last_name].filter(Boolean).join(" ").toLowerCase();
+              const id = String(u.id || "").toLowerCase();
+              const hit =
+                (name && name.includes(q)) ||
+                (email && email.includes(q)) ||
+                (id && id.includes(q));
+              if (!hit) continue;
             }
+            candidates.push(u);
+            if (candidates.length >= searchCap) break;
           }
 
           if (totalClerk && clerkOffset >= totalClerk) break;
@@ -304,9 +366,7 @@ export async function listStaffUsers(req, res) {
         return res.status(502).json(payload);
       }
 
-      const totalMatches = matches.length;
-      const slice = matches.slice(offset, offset + pageSize);
-      const ids = slice.map((u) => u.id);
+      const ids = candidates.map((u) => u.id);
 
       const lockedRows = ids.length
         ? await sql/*sql*/`
@@ -326,30 +386,22 @@ export async function listStaffUsers(req, res) {
       const lockedMap = new Map(lockedRows.map((r) => [r.user_id, r.locked]));
       const minersMap = new Map(minersRows.map((r) => [r.user_id, true]));
 
-      let items = slice.map((u) => toSafeUser(u, lockedMap, minersMap));
-      if (withInvoiceFlags && items.length) {
+      let items = candidates.map((u) => toSafeUser(u, lockedMap, minersMap));
+      if (needsInvoiceFlags && items.length) {
         try {
           items = await attachInvoiceFlags(items);
         } catch (e) {
-          console.warn(`[staff.listStaffUsers] reqId=${reqId} attachInvoiceFlags(search) failed`, e?.message || e);
+          console.warn(`[staff.listStaffUsers] reqId=${reqId} attachInvoiceFlags(global) failed`, e?.message || e);
         }
       }
 
-      if (order_by === "-created_at") {
-        items.sort((a, b) => {
-          const ta = a.created_at ? +new Date(a.created_at) : 0;
-          const tb = b.created_at ? +new Date(b.created_at) : 0;
-          return tb - ta;
-        });
-      } else {
-        items.sort((a, b) => {
-          const ta = a.created_at ? +new Date(a.created_at) : 0;
-          const tb = b.created_at ? +new Date(b.created_at) : 0;
-          return ta - tb;
-        });
-      }
+      items = applySearchAndFilter(items, { q, filter });
+      items = sortByCreated(items, order_by);
+      const totalMatches = items.length;
+      const paged = items.slice(offset, offset + pageSize);
+      const scanCapped = candidates.length >= searchCap && (!totalClerk || clerkOffset < totalClerk);
 
-      return res.json({ items, total: totalMatches, pageSize, offset, reqId });
+      return res.json({ items: paged, total: totalMatches, pageSize, offset, reqId, scan_capped: scanCapped });
     }
 
     /* ========= Listagem normal e pesquisa por email exato ========= */
@@ -403,7 +455,7 @@ export async function listStaffUsers(req, res) {
     const minersMap = new Map(minersRows.map((r) => [r.user_id, true]));
 
     let items = users.map((u) => toSafeUser(u, lockedMap, minersMap));
-    if (withInvoiceFlags && items.length) {
+    if (needsInvoiceFlags && items.length) {
       try {
         items = await attachInvoiceFlags(items);
       } catch (e) {
@@ -411,24 +463,11 @@ export async function listStaffUsers(req, res) {
       }
     }
 
-    // se qRaw não é email: já tratámos acima; aqui só pode ser "", ou email exato
-    // portanto não há filtro local extra (Clerk já filtrou por email_address)
+    // aqui qRaw pode ser "" ou email exato
+    items = applySearchAndFilter(items, { q, filter });
+    items = sortByCreated(items, order_by);
 
-    if (order_by === "-created_at") {
-      items.sort((a, b) => {
-        const ta = a.created_at ? +new Date(a.created_at) : 0;
-        const tb = b.created_at ? +new Date(b.created_at) : 0;
-        return tb - ta;
-      });
-    } else {
-      items.sort((a, b) => {
-        const ta = a.created_at ? +new Date(a.created_at) : 0;
-        const tb = b.created_at ? +new Date(b.created_at) : 0;
-        return ta - tb;
-      });
-    }
-
-    return res.json({ items, total, pageSize, offset, reqId });
+    return res.json({ items, total: filter === "all" ? total : items.length, pageSize, offset, reqId });
   } catch (err) {
     console.error(`[staff.listStaffUsers] reqId=${reqId}`, err);
     const payload = isProd
