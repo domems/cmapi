@@ -777,7 +777,15 @@ export async function offlineSummaryByMonth(req, res) {
         LEFT JOIN offline_timeline_json tj ON tj.miner_id = ms.miner_id
         LEFT JOIN offline_days_json dj ON dj.miner_id = ms.miner_id
         LEFT JOIN offline_hours_json hj ON hj.miner_id = ms.miner_id
-        GROUP BY ms.user_id, ms.miner_id, worker_name, tj.offline_timeline, dj.offline_days, hj.hot_hours_utc
+        GROUP BY
+          ms.user_id,
+          ms.miner_id,
+          ms.worker_name,
+          ms.nome,
+          ms.modelo,
+          tj.offline_timeline,
+          dj.offline_days,
+          hj.hot_hours_utc
         HAVING COALESCE(
           SUM(
             CASE
