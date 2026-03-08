@@ -2,6 +2,7 @@
 import express from "express";
 import { sql } from "../config/db.js";
 import { setCachedList, invalidateUserList } from "../services/minersListCache.js";
+import { getClerkUserById } from "../services/clerkUserService.js";
 
 /* ===================== Utils ===================== */
 const TAG = "[STAFF-MINERS+INVOICES]";
@@ -99,6 +100,7 @@ async function ensureHoursAuditTableOnce() {
       CREATE TABLE IF NOT EXISTS miner_hours_adjustments_audit (
         id BIGSERIAL PRIMARY KEY,
         miner_id BIGINT NOT NULL,
+        worker_name TEXT,
         miner_name TEXT,
         target_user_id TEXT NOT NULL,
         staff_user_id TEXT NOT NULL,
@@ -111,6 +113,10 @@ async function ensureHoursAuditTableOnce() {
         reason TEXT,
         changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `;
+    await sql/*sql*/`
+      ALTER TABLE miner_hours_adjustments_audit
+      ADD COLUMN IF NOT EXISTS worker_name TEXT
     `;
     await sql/*sql*/`
       CREATE INDEX IF NOT EXISTS idx_mhaa_target_time
@@ -154,6 +160,7 @@ function fmtHours(v) {
 
 async function logManualHoursAdjustment({
   minerId,
+  workerName,
   minerName,
   targetUserId,
   staffUserId,
@@ -169,11 +176,12 @@ async function logManualHoursAdjustment({
 
   const [auditRow] = await sql/*sql*/`
     INSERT INTO miner_hours_adjustments_audit (
-      miner_id, miner_name, target_user_id, staff_user_id, staff_role,
+      miner_id, worker_name, miner_name, target_user_id, staff_user_id, staff_role,
       hours_before, hours_after, hours_delta,
       request_ip, request_id, reason
     ) VALUES (
       ${minerId},
+      ${workerName || null},
       ${minerName || null},
       ${targetUserId},
       ${staffUserId || "unknown"},
@@ -191,7 +199,8 @@ async function logManualHoursAdjustment({
   const auditId = auditRow?.id;
   const changedAt = auditRow?.changed_at || new Date().toISOString();
   const title = "Horas online ajustadas";
-  const body = `A equipa ajustou ${minerName || `miner #${minerId}`} de ${fmtHours(hoursBefore)}h para ${fmtHours(hoursAfter)}h.`;
+  const workerLabel = String(workerName || "").trim() || String(minerName || "").trim() || `miner #${minerId}`;
+  const body = `A equipa ajustou ${workerLabel} de ${fmtHours(hoursBefore)}h para ${fmtHours(hoursAfter)}h.`;
 
   await sql/*sql*/`
     INSERT INTO notification_outbox (
@@ -208,6 +217,7 @@ async function logManualHoursAdjustment({
         data: {
           audit_id: auditId ?? null,
           miner_id: minerId,
+          worker_name: workerName || null,
           miner_name: minerName || null,
           changed_by_staff_user_id: staffUserId || null,
           staff_role: staffRole || null,
@@ -478,7 +488,7 @@ router.patch("/miners/:id", async (req, res) => {
 
   try {
     const [before] = await sql/*sql*/`
-      SELECT id, user_id, nome, total_horas_online
+      SELECT id, user_id, nome, worker_name, total_horas_online
       FROM miners
       WHERE id = ${id}
       LIMIT 1
@@ -535,6 +545,7 @@ router.patch("/miners/:id", async (req, res) => {
       try {
         await logManualHoursAdjustment({
           minerId: Number(updated.id),
+          workerName: String(updated.worker_name || before.worker_name || ""),
           minerName: String(updated.nome || before.nome || ""),
           targetUserId: String(updated.user_id || before.user_id || ""),
           staffUserId: String(req.auth?.userId || ""),
@@ -607,7 +618,7 @@ router.get("/users/:userId/miners/hours-audit", async (req, res) => {
 
     const rows = await sql/*sql*/`
       SELECT
-        id, miner_id, miner_name, target_user_id, staff_user_id, staff_role,
+        id, miner_id, worker_name, miner_name, target_user_id, staff_user_id, staff_role,
         hours_before, hours_after, hours_delta, reason, changed_at
       FROM miner_hours_adjustments_audit
       WHERE target_user_id = ${userId}
@@ -619,8 +630,41 @@ router.get("/users/:userId/miners/hours-audit", async (req, res) => {
       LIMIT ${limit}
     `;
 
-    const next_before_id = rows.length === limit ? rows[rows.length - 1]?.id ?? null : null;
-    return res.json({ items: rows, next_before_id, year, month });
+    const staffIds = Array.from(
+      new Set(rows.map((r) => String(r?.staff_user_id || "").trim()).filter(Boolean))
+    );
+    const staffNameMap = new Map();
+
+    await Promise.all(
+      staffIds.map(async (sid) => {
+        try {
+          const u = await getClerkUserById(sid);
+          const first = String(u?.first_name || "").trim();
+          const last = String(u?.last_name || "").trim();
+          const full = [first, last].filter(Boolean).join(" ").trim();
+          const staffName =
+            full ||
+            String(u?.username || "").trim() ||
+            String(u?.primary_email_address?.email_address || "").trim() ||
+            "Staff";
+          staffNameMap.set(sid, staffName);
+        } catch {
+          staffNameMap.set(sid, "Staff");
+        }
+      })
+    );
+
+    const sanitized = rows.map((r) => {
+      const sid = String(r?.staff_user_id || "").trim();
+      const { staff_user_id, ...rest } = r;
+      return {
+        ...rest,
+        staff_name: sid ? staffNameMap.get(sid) || "Staff" : "Staff",
+      };
+    });
+
+    const next_before_id = sanitized.length === limit ? sanitized[sanitized.length - 1]?.id ?? null : null;
+    return res.json({ items: sanitized, next_before_id, year, month });
   } catch (e) {
     error("GET /users/:userId/miners/hours-audit", e?.message || e);
     return res.status(500).json({ error: "Erro ao carregar auditoria das horas online" });
