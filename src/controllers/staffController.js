@@ -525,6 +525,10 @@ export async function offlineSummaryByMonth(req, res) {
     const now = new Date();
     const year = clampInt(req.query.year, 2000, 2100, now.getUTCFullYear());
     const month = clampInt(req.query.month, 1, 12, now.getUTCMonth() + 1);
+    const includeEstimated =
+      String(req.query.include_estimated ?? req.query.includeEstimated ?? "0")
+        .trim()
+        .toLowerCase() === "1";
 
     const startUtc = new Date(Date.UTC(year, month - 1, 1, 0, 0, 0, 0));
     const endUtc = new Date(Date.UTC(year, month, 1, 0, 0, 0, 0));
@@ -792,7 +796,7 @@ export async function offlineSummaryByMonth(req, res) {
       console.warn("staff.offlineSummaryByMonth events query fallback:", err?.message || err);
     }
 
-    if (!rows.length) {
+    if (!rows.length && includeEstimated) {
       if (isCurrentMonth) {
         source = "estimated_current_hours_online";
         try {
@@ -843,6 +847,8 @@ export async function offlineSummaryByMonth(req, res) {
           console.warn("staff.offlineSummaryByMonth invoice fallback failed:", err?.message || err);
         }
       }
+    } else if (!rows.length && !includeEstimated) {
+      source = "events_no_data";
     }
 
     const users = mapOfflineRowsToUsers(rows);
@@ -876,6 +882,7 @@ export async function offlineSummaryByMonth(req, res) {
         offline_hours: Number(totalOfflineHours.toFixed(2)),
       },
       source,
+      include_estimated: includeEstimated,
       users,
     });
   } catch (err) {
