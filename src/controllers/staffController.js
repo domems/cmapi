@@ -589,26 +589,55 @@ export async function offlineSummaryByMonth(req, res) {
           SELECT
             ms.miner_id,
             b.month_start AS ts,
-            COALESCE(pe.state, ps.state, 'ONLINE') AS state
+            COALESCE(pe.state, ps.state, 'ONLINE') AS state,
+            1::int AS src_priority
           FROM miners_scope ms
           JOIN month_bounds b ON true
           LEFT JOIN prev_event_state pe ON pe.miner_id = ms.miner_id
           LEFT JOIN prev_stable_state ps ON ps.miner_id = ms.miner_id
         ),
+        stable_points AS (
+          SELECT
+            s.miner_id,
+            GREATEST(s.stable_since_utc, b.month_start) AS ts,
+            UPPER(s.current_state) AS state,
+            2::int AS src_priority
+          FROM miner_state s
+          JOIN month_bounds b ON true
+          WHERE s.stable_since_utc < b.month_effective_end
+        ),
         event_points AS (
           SELECT
             e.miner_id,
             e.occurred_at_utc AS ts,
-            UPPER(e.to_state) AS state
+            UPPER(e.to_state) AS state,
+            3::int AS src_priority
           FROM miner_state_events e
           JOIN month_bounds b ON true
           WHERE e.occurred_at_utc >= b.month_start
             AND e.occurred_at_utc < b.month_effective_end
         ),
-        timeline_points AS (
-          SELECT miner_id, ts, state FROM initial_points
+        timeline_points_raw AS (
+          SELECT miner_id, ts, state, src_priority FROM initial_points
           UNION ALL
-          SELECT miner_id, ts, state FROM event_points
+          SELECT miner_id, ts, state, src_priority FROM stable_points
+          UNION ALL
+          SELECT miner_id, ts, state, src_priority FROM event_points
+        ),
+        timeline_points AS (
+          SELECT miner_id, ts, state
+          FROM (
+            SELECT
+              tpr.miner_id,
+              tpr.ts,
+              tpr.state,
+              ROW_NUMBER() OVER (
+                PARTITION BY tpr.miner_id, tpr.ts
+                ORDER BY tpr.src_priority DESC
+              ) AS rn
+            FROM timeline_points_raw tpr
+          ) dedup
+          WHERE dedup.rn = 1
         ),
         ranked_points AS (
           SELECT
