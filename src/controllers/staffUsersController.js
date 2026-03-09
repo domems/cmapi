@@ -259,8 +259,15 @@ async function attachInvoiceFlags(items) {
     WITH base AS (
       SELECT user_id::text, MIN(created_at) AS oldest_unsettled_created_at
       FROM public.energy_invoices
-      WHERE status NOT IN ('pago','cancelado')
-        AND user_id = ANY(${userIds})
+      WHERE user_id = ANY(${userIds})
+        AND LOWER(COALESCE(status, '')) IN (
+          'pendente',
+          'pending',
+          'aguarda_pagamento',
+          'awaiting_payment',
+          'unpaid',
+          'overdue'
+        )
       GROUP BY user_id
     )
     SELECT
