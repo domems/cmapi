@@ -305,11 +305,15 @@ export async function listStaffUsers(req, res) {
     const orderParam = String(req.query.order || "-created_at");
     const order_by = orderParam.startsWith("-") ? "-created_at" : "created_at";
     const filter = normalizeFilter(req.query.filter);
+    const forceGlobalScan = truthyFlag(req.query.globalScan ?? req.query.global_scan);
     const withInvoiceFlags = truthyFlag(req.query.withInvoiceFlags);
     const needsInvoiceFlags = withInvoiceFlags || filter === "overdue5";
 
     const isEmailSearch = qRaw && looksLikeEmail(qRaw);
-    const needsGlobalScan = (qRaw && !isEmailSearch) || (filter !== "all" && !isEmailSearch);
+    const needsGlobalScan =
+      forceGlobalScan ||
+      (qRaw && !isEmailSearch) ||
+      (filter !== "all" && !isEmailSearch);
 
     /* ========= Pesquisa/filtro global ========= */
     if (needsGlobalScan) {
@@ -504,6 +508,38 @@ export async function listStaffUsers(req, res) {
       ? { error: "failed_list_users", reqId }
       : { error: "failed_list_users", reqId, detail: String(err?.message || err) };
     return res.status(500).json(payload);
+  }
+}
+
+/* ===== GET /staff/users/count ===== */
+export async function getStaffUsersCount(_req, res) {
+  const reqId = genReqId();
+  res.setHeader("x-request-id", reqId);
+
+  try {
+    const payload = await clerkFetch("/users/count");
+    const total = Number(payload?.total_count);
+    return res.json({
+      total: Number.isFinite(total) && total >= 0 ? total : 0,
+      reqId,
+    });
+  } catch (e) {
+    if (e && e.message === "RATE_LIMIT") {
+      res.setHeader("Retry-After", String(e.retryAfter));
+      return res
+        .status(429)
+        .json({ error: "rate_limited", retry_after: e.retryAfter, reqId });
+    }
+    if (e && (e.status === 401 || e.status === 403)) {
+      const payload = isProd
+        ? { error: "clerk_auth_failed", reqId }
+        : { error: "clerk_auth_failed", reqId, detail: e.message };
+      return res.status(502).json(payload);
+    }
+    const payload = isProd
+      ? { error: "clerk_error", reqId }
+      : { error: "clerk_error", reqId, detail: e?.message || String(e) };
+    return res.status(502).json(payload);
   }
 }
 

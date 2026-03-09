@@ -15,6 +15,7 @@ import {
 
 import {
   listStaffUsers,
+  getStaffUsersCount,
   lockUser,
   unlockUser,
   makeStaff,
@@ -54,6 +55,7 @@ router.get("/miner-state-events", listarMinerStateEvents);
 router.get("/offline-summary", offlineSummaryByMonth);
 
 /* ---------- Gestão de utilizadores (staff/admin) ---------- */
+router.get("/users/count", getStaffUsersCount);
 router.get("/users", listStaffUsers);
 router.post("/users/:id/lock", lockUser);
 router.post("/users/:id/unlock", unlockUser);
