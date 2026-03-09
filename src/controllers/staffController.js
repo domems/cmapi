@@ -522,6 +522,10 @@ export async function listarMinerStateEvents(req, res) {
 /* ---------- Resumo mensal de offline por user/miner ---------- */
 export async function offlineSummaryByMonth(req, res) {
   try {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+
     const now = new Date();
     const year = clampInt(req.query.year, 2000, 2100, now.getUTCFullYear());
     const month = clampInt(req.query.month, 1, 12, now.getUTCMonth() + 1);
@@ -538,6 +542,7 @@ export async function offlineSummaryByMonth(req, res) {
 
     const isCurrentMonth =
       year === now.getUTCFullYear() && month === now.getUTCMonth() + 1;
+    const analysisEndUtc = new Date(Math.min(endUtc.getTime(), now.getTime()));
     const fullMonthHours = Math.max(0, (endUtc.getTime() - startUtc.getTime()) / 3_600_000);
     const elapsedMonthHours = Math.max(
       0,
@@ -551,7 +556,8 @@ export async function offlineSummaryByMonth(req, res) {
       rows = await sql/*sql*/`
         WITH month_bounds AS (
           SELECT ${startUtc.toISOString()}::timestamptz AS month_start,
-                 ${endUtc.toISOString()}::timestamptz AS month_end
+                 ${endUtc.toISOString()}::timestamptz AS month_end,
+                 ${analysisEndUtc.toISOString()}::timestamptz AS month_effective_end
         ),
         miners_scope AS (
           SELECT
@@ -597,7 +603,7 @@ export async function offlineSummaryByMonth(req, res) {
           FROM miner_state_events e
           JOIN month_bounds b ON true
           WHERE e.occurred_at_utc >= b.month_start
-            AND e.occurred_at_utc < b.month_end
+            AND e.occurred_at_utc < b.month_effective_end
         ),
         timeline_points AS (
           SELECT miner_id, ts, state FROM initial_points
@@ -617,10 +623,10 @@ export async function offlineSummaryByMonth(req, res) {
             rp.miner_id,
             rp.state,
             rp.ts AS started_at,
-            COALESCE(rp.next_ts, b.month_end) AS ended_at
+            COALESCE(rp.next_ts, b.month_effective_end) AS ended_at
           FROM ranked_points rp
           JOIN month_bounds b ON true
-          WHERE COALESCE(rp.next_ts, b.month_end) > rp.ts
+          WHERE COALESCE(rp.next_ts, b.month_effective_end) > rp.ts
         ),
         offline_segments AS (
           SELECT
@@ -882,7 +888,7 @@ export async function offlineSummaryByMonth(req, res) {
         year,
         month,
         start_utc: startUtc.toISOString(),
-        end_utc: endUtc.toISOString(),
+        end_utc: analysisEndUtc.toISOString(),
       },
       totals: {
         users: users.length,
