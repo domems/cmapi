@@ -188,6 +188,44 @@ function mapOfflineRowsToUsers(rows) {
     .sort((a, b) => b.offline_hours - a.offline_hours);
 }
 
+function mergeEstimatedOfflineRows(baseRows, estimatedRows) {
+  const keyOf = (r) => `${String(r?.user_id || "")}:${String(r?.miner_id || "")}`;
+  const normalizeRow = (r) => {
+    const offlineHours =
+      r?.offline_hours != null
+        ? toHours(r.offline_hours)
+        : toHours(r?.offline_seconds) / 3600;
+    return {
+      ...r,
+      offline_intervals: Number(r?.offline_intervals || 0),
+      offline_timeline: r?.offline_timeline ?? [],
+      offline_days: r?.offline_days ?? [],
+      hot_hours_utc: r?.hot_hours_utc ?? [],
+      offline_hours: Number(offlineHours.toFixed(2)),
+      offline_seconds: Number((offlineHours * 3600).toFixed(2)),
+    };
+  };
+
+  const out = [];
+  const seen = new Set();
+
+  for (const row of baseRows || []) {
+    const key = keyOf(row);
+    if (!key) continue;
+    out.push(normalizeRow(row));
+    seen.add(key);
+  }
+
+  for (const row of estimatedRows || []) {
+    const key = keyOf(row);
+    if (!key || seen.has(key)) continue;
+    out.push(normalizeRow(row));
+    seen.add(key);
+  }
+
+  return out;
+}
+
 /* ---------- Health ---------- */
 export async function ping(_req, res) {
   res.json({ ok: true, ts: new Date().toISOString() });
@@ -839,11 +877,15 @@ export async function offlineSummaryByMonth(req, res) {
       console.warn("staff.offlineSummaryByMonth events query fallback:", err?.message || err);
     }
 
-    if (!rows.length && includeEstimated) {
+    if (includeEstimated) {
+      let estimatedRows = [];
+      let estimatedSource = isCurrentMonth
+        ? "estimated_current_hours_online"
+        : "estimated_invoice_hours_online";
+
       if (isCurrentMonth) {
-        source = "estimated_current_hours_online";
         try {
-          rows = await sql/*sql*/`
+          estimatedRows = await sql/*sql*/`
             SELECT
               m.user_id::text AS user_id,
               m.id AS miner_id,
@@ -853,20 +895,22 @@ export async function offlineSummaryByMonth(req, res) {
                 CONCAT('Miner #', m.id::text)
               ) AS worker_name,
               0::int AS offline_intervals,
+              '[]'::jsonb AS offline_timeline,
+              '[]'::jsonb AS offline_days,
+              '[]'::jsonb AS hot_hours_utc,
               GREATEST(${elapsedMonthHours}::double precision - COALESCE(m.total_horas_online, 0)::double precision, 0)::double precision AS offline_hours
             FROM miners m
             WHERE GREATEST(${elapsedMonthHours}::double precision - COALESCE(m.total_horas_online, 0)::double precision, 0) > 0
             ORDER BY offline_hours DESC, m.id ASC
           `;
         } catch (err) {
-          rows = [];
-          source = "fallback_unavailable";
+          estimatedRows = [];
+          estimatedSource = "fallback_unavailable";
           console.warn("staff.offlineSummaryByMonth current fallback failed:", err?.message || err);
         }
       } else {
-        source = "estimated_invoice_hours_online";
         try {
-          rows = await sql/*sql*/`
+          estimatedRows = await sql/*sql*/`
             SELECT
               ei.user_id::text AS user_id,
               eii.miner_id,
@@ -875,6 +919,9 @@ export async function offlineSummaryByMonth(req, res) {
                 CONCAT('Miner #', eii.miner_id::text)
               ) AS worker_name,
               0::int AS offline_intervals,
+              '[]'::jsonb AS offline_timeline,
+              '[]'::jsonb AS offline_days,
+              '[]'::jsonb AS hot_hours_utc,
               GREATEST(${fullMonthHours}::double precision - COALESCE(MAX(eii.hours_online), 0)::double precision, 0)::double precision AS offline_hours
             FROM energy_invoices ei
             JOIN energy_invoice_items eii ON eii.invoice_id = ei.id
@@ -885,12 +932,29 @@ export async function offlineSummaryByMonth(req, res) {
             ORDER BY offline_hours DESC, eii.miner_id ASC
           `;
         } catch (err) {
-          rows = [];
-          source = "fallback_unavailable";
+          estimatedRows = [];
+          estimatedSource = "fallback_unavailable";
           console.warn("staff.offlineSummaryByMonth invoice fallback failed:", err?.message || err);
         }
       }
-    } else if (!rows.length && !includeEstimated) {
+
+      if (estimatedRows.length) {
+        if (rows.length) {
+          const merged = mergeEstimatedOfflineRows(rows, estimatedRows);
+          if (merged.length > rows.length) {
+            source = `${source}+${estimatedSource}`;
+          }
+          rows = merged;
+        } else {
+          rows = estimatedRows;
+          source = estimatedSource;
+        }
+      } else if (!rows.length && estimatedSource === "fallback_unavailable") {
+        source = "fallback_unavailable";
+      } else if (!rows.length) {
+        source = "events_no_data";
+      }
+    } else if (!rows.length) {
       source = "events_no_data";
     }
 
