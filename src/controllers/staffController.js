@@ -113,6 +113,145 @@ function normalizeHotHours(input) {
     .filter((h) => Number.isFinite(h.hour_utc) && h.hour_utc >= 0 && h.hour_utc <= 23 && h.offline_hours > 0)
     .sort((a, b) => b.offline_hours - a.offline_hours || a.hour_utc - b.hour_utc);
 }
+function buildSyntheticOfflineArtifacts(offlineHours, periodStartUtc, periodEndUtc) {
+  const totalHours = toHours(offlineHours);
+  const startMs = periodStartUtc instanceof Date ? periodStartUtc.getTime() : Date.parse(String(periodStartUtc || ""));
+  const endMs = periodEndUtc instanceof Date ? periodEndUtc.getTime() : Date.parse(String(periodEndUtc || ""));
+  if (!(totalHours > 0) || !Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) {
+    return { offline_intervals: 0, offline_timeline: [], offline_days: [], hot_hours_utc: [] };
+  }
+
+  const syntheticStartMs = Math.max(startMs, endMs - totalHours * 3_600_000);
+  if (syntheticStartMs >= endMs) {
+    return { offline_intervals: 0, offline_timeline: [], offline_days: [], hot_hours_utc: [] };
+  }
+
+  const dayMap = new Map();
+  let cursorMs = syntheticStartMs;
+  while (cursorMs < endMs) {
+    const cursor = new Date(cursorMs);
+    const dayStartMs = Date.UTC(
+      cursor.getUTCFullYear(),
+      cursor.getUTCMonth(),
+      cursor.getUTCDate(),
+      0,
+      0,
+      0,
+      0
+    );
+    const nextDayMs = dayStartMs + 86_400_000;
+    const sliceEndMs = Math.min(endMs, nextDayMs);
+    const sliceHours = (sliceEndMs - cursorMs) / 3_600_000;
+    if (sliceHours > 0) {
+      const dayUtc = new Date(dayStartMs).toISOString().slice(0, 10);
+      const prev = dayMap.get(dayUtc) || { day_utc: dayUtc, offline_hours: 0, intervals: [] };
+      prev.offline_hours = Number((toHours(prev.offline_hours) + sliceHours).toFixed(2));
+      prev.intervals.push({
+        start_utc: new Date(cursorMs).toISOString(),
+        end_utc: new Date(sliceEndMs).toISOString(),
+        offline_hours: Number(sliceHours.toFixed(2)),
+      });
+      dayMap.set(dayUtc, prev);
+    }
+    cursorMs = sliceEndMs;
+  }
+
+  const offline_timeline = Array.from(dayMap.values()).sort((a, b) =>
+    String(a.day_utc).localeCompare(String(b.day_utc))
+  );
+  const offline_days = offline_timeline
+    .map((d) => ({
+      day_utc: String(d.day_utc),
+      offline_hours: Number(toHours(d.offline_hours).toFixed(2)),
+    }))
+    .sort((a, b) => b.offline_hours - a.offline_hours || a.day_utc.localeCompare(b.day_utc));
+
+  const hourMap = new Map();
+  let hourCursorMs = syntheticStartMs;
+  while (hourCursorMs < endMs) {
+    const dt = new Date(hourCursorMs);
+    const hourStartMs = Date.UTC(
+      dt.getUTCFullYear(),
+      dt.getUTCMonth(),
+      dt.getUTCDate(),
+      dt.getUTCHours(),
+      0,
+      0,
+      0
+    );
+    const nextHourMs = hourStartMs + 3_600_000;
+    const sliceEndMs = Math.min(endMs, nextHourMs);
+    const sliceHours = (sliceEndMs - hourCursorMs) / 3_600_000;
+    if (sliceHours > 0) {
+      const hour = new Date(hourStartMs).getUTCHours();
+      const prev = toHours(hourMap.get(hour));
+      hourMap.set(hour, Number((prev + sliceHours).toFixed(2)));
+    }
+    hourCursorMs = sliceEndMs;
+  }
+  const hot_hours_utc = Array.from(hourMap.entries())
+    .map(([hour_utc, value]) => ({
+      hour_utc: Number(hour_utc),
+      offline_hours: Number(toHours(value).toFixed(2)),
+    }))
+    .filter((h) => Number.isFinite(h.hour_utc) && h.hour_utc >= 0 && h.hour_utc <= 23 && h.offline_hours > 0)
+    .sort((a, b) => b.offline_hours - a.offline_hours || a.hour_utc - b.hour_utc);
+
+  return {
+    offline_intervals: 1,
+    offline_timeline,
+    offline_days,
+    hot_hours_utc,
+  };
+}
+function withSyntheticOfflineDetails(rows, { periodStartUtc, periodEndUtc }) {
+  return (rows || []).map((r) => {
+    const hoursFromRow =
+      r?.offline_hours != null
+        ? toHours(r.offline_hours)
+        : toHours(r?.offline_seconds) / 3600;
+    if (!(hoursFromRow > 0)) return r;
+
+    const timeline = normalizeOfflineTimeline(r?.offline_timeline);
+    const days = normalizeOfflineDays(r?.offline_days);
+    const hotHours = normalizeHotHours(r?.hot_hours_utc);
+    const timelineIntervals = timeline.reduce(
+      (acc, d) => acc + (Array.isArray(d?.intervals) ? d.intervals.length : 0),
+      0
+    );
+    const rawIntervals = Number.parseInt(String(r?.offline_intervals ?? 0), 10);
+    const intervalsCount = Number.isFinite(rawIntervals) ? rawIntervals : 0;
+
+    if (timelineIntervals > 0) {
+      return {
+        ...r,
+        offline_intervals: Math.max(intervalsCount, timelineIntervals),
+        offline_timeline: timeline,
+        offline_days:
+          days.length > 0
+            ? days
+            : timeline.map((d) => ({
+                day_utc: d.day_utc,
+                offline_hours: Number(toHours(d.offline_hours).toFixed(2)),
+              })),
+        hot_hours_utc: hotHours,
+      };
+    }
+
+    const synthetic = buildSyntheticOfflineArtifacts(
+      hoursFromRow,
+      periodStartUtc,
+      periodEndUtc
+    );
+    return {
+      ...r,
+      offline_intervals: Math.max(intervalsCount, synthetic.offline_intervals),
+      offline_timeline: synthetic.offline_timeline,
+      offline_days: synthetic.offline_days,
+      hot_hours_utc: synthetic.hot_hours_utc,
+    };
+  });
+}
 function mapOfflineRowsToUsers(rows) {
   const byUser = new Map();
   for (const r of rows || []) {
@@ -957,6 +1096,11 @@ export async function offlineSummaryByMonth(req, res) {
     } else if (!rows.length) {
       source = "events_no_data";
     }
+
+    rows = withSyntheticOfflineDetails(rows, {
+      periodStartUtc: startUtc,
+      periodEndUtc: analysisEndUtc,
+    });
 
     const users = mapOfflineRowsToUsers(rows);
 
