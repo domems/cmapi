@@ -1,9 +1,20 @@
 {
   "version": 2,
+  "functions": {
+    "src/server.js": {
+      "maxDuration": 60
+    }
+  },
   "builds": [
     {
       "src": "src/server.js",
       "use": "@vercel/node"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/internal/jobs/detect-state",
+      "schedule": "* * * * *"
     }
   ],
   "routes": [

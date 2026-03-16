@@ -29,6 +29,7 @@ import notificationsRouter from "./routes/notifications.js";
 import pushRouter from "./routes/push.js";
 import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
+import internalJobsRouter from "./routes/internalJobs.js";
 import staffRouter from "./routes/staff.js"; // <-- isto faltava/estava errado no teu deploy
 
 dotenv.config();
@@ -150,6 +151,9 @@ app.get(
   minersListLimiter,
   listarMinersPorUser
 );
+
+// cron interno (Vercel) para jobs que precisam de execução contínua
+app.use("/api/internal", internalJobsRouter);
 
 /* ================= Middlewares/rotas do resto da app ================= */
 // Limiter global

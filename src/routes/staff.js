@@ -5,13 +5,18 @@ import {
   statsMiners,
   currentSummary,
   listarFaturasGlobais,
-  notificationsUnreadCount,
   listarMinersGlobais,
   obterStatusBatch,
   obterStatusPorId,
   listarMinerStateEvents,
   offlineSummaryByMonth,
 } from "../controllers/staffController.js";
+import {
+  listStaffNotifications,
+  unreadStaffNotificationsCount,
+  ackStaffNotification,
+  ackAllStaffNotifications,
+} from "../controllers/staffNotificationsController.js";
 
 import {
   listStaffUsers,
@@ -41,7 +46,10 @@ router.get("/invoices/current/summary", currentSummary);
 router.get("/invoices", listarFaturasGlobais);
 
 /* ---------- Notificações por ler (global) ---------- */
-router.get("/notifications/unread_count", notificationsUnreadCount);
+router.get("/notifications", listStaffNotifications);
+router.get("/notifications/unread_count", unreadStaffNotificationsCount);
+router.post("/notifications/:id/ack", ackStaffNotification);
+router.post("/notifications/ack_all", ackAllStaffNotifications);
 
 /* ---------- Miners globais (com ETag, paginação e ?coin=BTC) ---------- */
 router.get("/miners", listarMinersGlobais);

@@ -1,6 +1,7 @@
 // src/detectors/stateDetector.js
 import { sql } from "../config/db.js";
 import { buildPushFromTemplate } from "../services/notificationTemplates.js";
+import { enqueueStaffStateAlert } from "../services/staffAlerts.js";
 
 const asRows = (res) => (Array.isArray(res) ? res : (res?.rows ?? []));
 
@@ -155,6 +156,20 @@ export async function processMiner(minerId) {
         `;
       }
     }
+  }
+
+  // 4) alertas operacionais para staff (não bloqueia o fluxo principal)
+  try {
+    await enqueueStaffStateAlert({
+      minerId,
+      workerName: miner.worker_name || null,
+      fromState: prev,
+      toState: next,
+      slotIso: sISO,
+      occurredAtUtc: now.toISOString(),
+    });
+  } catch (e) {
+    console.warn("[stateDetector] enqueueStaffStateAlert failed:", e?.message || e);
   }
 
   return { changed: true, from: prev, to: next };
