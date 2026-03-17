@@ -23,7 +23,10 @@ function readPrefs(user) {
 
   const appPrefs   = pm.appPrefs ?? um.appPrefs ?? pub.appPrefs ?? {};
   const appNotifs  = appPrefs.notifications ?? {};
+  const appStaffNotifs = appPrefs.staffNotifications ?? {};
   const flatNotifs = pm.notifications ?? um.notifications ?? pub.notifications ?? {};
+  const flatStaffNotifs =
+    pm.notificationsStaff ?? um.notificationsStaff ?? pub.notificationsStaff ?? {};
 
   // toggles (sinónimos)
   const minerStatusOnline  = firstDefined(appNotifs.minerStatusOnline,  flatNotifs.minerOnline);
@@ -31,6 +34,24 @@ function readPrefs(user) {
   const minerMaintenance   = firstDefined(appNotifs.minerMaintenance,   flatNotifs.minerMaintenance);
   const invoiceClosed      = firstDefined(appNotifs.invoiceClosed,      flatNotifs.invoiceClosed);
   const invoiceLate5d      = firstDefined(appNotifs.invoiceLate5d,      flatNotifs.invoiceLate5d);
+  const staffMinerOfflineP1 = firstDefined(
+    appStaffNotifs.minerOfflineP1,
+    appStaffNotifs.staffMinerOfflineP1,
+    flatStaffNotifs.minerOfflineP1,
+    flatStaffNotifs.staffMinerOfflineP1
+  );
+  const staffMinerRecoveredP2 = firstDefined(
+    appStaffNotifs.minerRecoveredP2,
+    appStaffNotifs.staffMinerRecoveredP2,
+    flatStaffNotifs.minerRecoveredP2,
+    flatStaffNotifs.staffMinerRecoveredP2
+  );
+  const staffMinerMaintenanceP2 = firstDefined(
+    appStaffNotifs.minerMaintenanceP2,
+    appStaffNotifs.staffMinerMaintenanceP2,
+    flatStaffNotifs.minerMaintenanceP2,
+    flatStaffNotifs.staffMinerMaintenanceP2
+  );
 
   // cooldown
   const offlineCooldownMin = firstDefined(
@@ -52,6 +73,9 @@ function readPrefs(user) {
     minerMaintenance,
     invoiceClosed,
     invoiceLate5d,
+    staffMinerOfflineP1,
+    staffMinerRecoveredP2,
+    staffMinerMaintenanceP2,
     offlineCooldownMin,
     channels,
   };
@@ -65,6 +89,9 @@ function keyForTemplate(template) {
     case "miner_offline_reminder": return "minerStatusOffline";
     case "invoice_closed":         return "invoiceClosed";
     case "invoice_late_5d":        return "invoiceLate5d";
+    case "staff_miner_offline_p1":     return "staffMinerOfflineP1";
+    case "staff_miner_recovered_p2":   return "staffMinerRecoveredP2";
+    case "staff_miner_maintenance_p2": return "staffMinerMaintenanceP2";
     default:                       return null;
   }
 }
