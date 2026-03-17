@@ -23,39 +23,39 @@ export function buildPushFromTemplate(template, payload = {}) {
         case "staff_miner_offline_p1":
             if (toCount(payload) > 1) {
                 return {
-                    title: `P1: ${toCount(payload)} miners offline`,
+                    title: `${toCount(payload)} miners offline`,
                     body: workersPreview(payload) || "Multiple miners went offline",
                     data: { type: "staff_alert", severity: "P1", ...payload }
                 };
             }
             return {
-                title: "P1: Miner offline",
+                title: "Miner offline",
                 body: payload.worker ? `${payload.worker} went offline` : `Miner #${payload.minerId} went offline`,
                 data: { type: "staff_alert", severity: "P1", ...payload }
             };
         case "staff_miner_recovered_p2":
             if (toCount(payload) > 1) {
                 return {
-                    title: `P2: ${toCount(payload)} miners recovered`,
+                    title: `${toCount(payload)} miners recovered`,
                     body: workersPreview(payload) || "Multiple miners are back online",
                     data: { type: "staff_alert", severity: "P2", ...payload }
                 };
             }
             return {
-                title: "P2: Miner recovered",
+                title: "Miner recovered",
                 body: payload.worker ? `${payload.worker} is back online` : `Miner #${payload.minerId} is back online`,
                 data: { type: "staff_alert", severity: "P2", ...payload }
             };
         case "staff_miner_maintenance_p2":
             if (toCount(payload) > 1) {
                 return {
-                    title: `P2: ${toCount(payload)} miners in maintenance`,
+                    title: `${toCount(payload)} miners in maintenance`,
                     body: workersPreview(payload) || "Multiple miners entered maintenance",
                     data: { type: "staff_alert", severity: "P2", ...payload }
                 };
             }
             return {
-                title: "P2: Maintenance state",
+                title: "Maintenance state",
                 body: payload.worker ? `${payload.worker} entered maintenance` : `Miner #${payload.minerId} entered maintenance`,
                 data: { type: "staff_alert", severity: "P2", ...payload }
             };
