@@ -6,12 +6,6 @@
       "use": "@vercel/node"
     }
   ],
-  "crons": [
-    {
-      "path": "/api/internal/jobs/detect-state",
-      "schedule": "* * * * *"
-    }
-  ],
   "routes": [
     {
       "src": "/(.*)",
