@@ -50,7 +50,7 @@ function userDisplayFromClerk(user) {
   if (!user || typeof user !== "object") return { name: null, email: null };
   const first = String(user.first_name || "").trim();
   const last = String(user.last_name || "").trim();
-  const name = [first, last].filter(Boolean).join(" ").trim() || user.username || null;
+  const name = [first, last].filter(Boolean).join(" ").trim() || null;
   const email = pickPrimaryEmailFromClerkUser(user);
   return { name: name || null, email: email || null };
 }
