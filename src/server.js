@@ -31,6 +31,7 @@ import prefsRouter from "./routes/prefs.js";
 import authRouter from "./routes/auth.js";
 import internalJobsRouter from "./routes/internalJobs.js";
 import staffRouter from "./routes/staff.js"; // <-- isto faltava/estava errado no teu deploy
+import supportRouter from "./routes/support.js";
 
 dotenv.config();
 
@@ -163,6 +164,7 @@ app.use(rateLimiter);
 app.use("/api/clerk", requireAuth(), adminOrStaffOnly, clerkRoutes);
 app.use("/api", statusRoutes);
 app.use("/api", storeMinersRoutes);
+app.use("/api", supportRouter);
 
 // Payments normal (create-intent, intent, sync, qr)
 app.use("/api", paymentsRoutes);
