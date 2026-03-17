@@ -30,6 +30,13 @@ function clampInt(v, min, max, fallback) {
   if (!Number.isFinite(n)) return fallback;
   return Math.max(min, Math.min(max, n));
 }
+function parseBool(v, fallback = false) {
+  if (v === undefined || v === null || v === "") return fallback;
+  const s = String(v).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(s)) return true;
+  if (["0", "false", "no", "n", "off"].includes(s)) return false;
+  return fallback;
+}
 function pickPrimaryEmailFromClerkUser(user) {
   const arr = Array.isArray(user?.email_addresses) ? user.email_addresses : [];
   const primaryId = user?.primary_email_address_id || null;
@@ -513,6 +520,8 @@ export async function listarMinersGlobais(req, res) {
     const coin = parseCoinQuery(req);
     const { page, pageSize, offset, limit } = parsePaging(req);
     const whereCoin = coin ? sql`WHERE UPPER(coin) = ${coin}` : sql``;
+    const includeUserProfile = parseBool(req.query.includeUserProfile, false);
+    const userLookupCap = clampInt(req.query.userLookupCap, 0, 200, 120);
 
     const [{ total, last_ts }] = await sql/*sql*/`
       SELECT COUNT(*)::int AS total,
@@ -525,7 +534,7 @@ export async function listarMinersGlobais(req, res) {
     if (String(req.headers["if-none-match"] || "") === etag) return res.status(304).end();
 
     // Apenas campos que EXISTEM na tua tabela
-    const items = await sql/*sql*/`
+    const rawItems = await sql/*sql*/`
       SELECT
         id,
         user_id,
@@ -546,6 +555,43 @@ export async function listarMinersGlobais(req, res) {
       ORDER BY ${ORDER_BY_RECENTE}
       LIMIT ${limit} OFFSET ${offset}
     `;
+
+    let items = rawItems;
+
+    if (includeUserProfile && userLookupCap > 0 && Array.isArray(rawItems) && rawItems.length) {
+      const ids = Array.from(
+        new Set(
+          rawItems
+            .map((r) => String(r?.user_id || "").trim())
+            .filter(Boolean)
+        )
+      ).slice(0, userLookupCap);
+
+      if (ids.length) {
+        const profileMap = new Map();
+        await Promise.allSettled(
+          ids.map(async (uid) => {
+            try {
+              const clerkUser = await getClerkUserById(uid);
+              const profile = userDisplayFromClerk(clerkUser);
+              profileMap.set(uid, profile);
+            } catch {
+              // sem perfil fica null e frontend usa fallback
+            }
+          })
+        );
+
+        items = rawItems.map((r) => {
+          const uid = String(r?.user_id || "").trim();
+          const profile = uid ? profileMap.get(uid) : null;
+          return {
+            ...r,
+            user_name: profile?.name || null,
+            user_email: profile?.email || null,
+          };
+        });
+      }
+    }
 
     res.json({ items, total: total ?? items.length, page, pageSize });
   } catch (err) {
