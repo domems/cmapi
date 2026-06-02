@@ -7,9 +7,24 @@ import { buildPushFromTemplate } from "../services/notificationTemplates.js";
 const TZ = "Europe/Lisbon";
 const MIN_INVOICE_USD = 15; // valor mínimo para fechar fatura
 
+function getLisbonDateParts(baseDate = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(baseDate);
+
+  const values = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return {
+    year: Number(values.year),
+    month: Number(values.month),
+    day: Number(values.day),
+  };
+}
+
 function previousMonthLisbon(baseDate = new Date()) {
-  const y = baseDate.getFullYear();
-  const m = baseDate.getMonth() + 1;
+  const { year: y, month: m } = getLisbonDateParts(baseDate);
   if (m === 1) return { year: y - 1, month: 12 };
   return { year: y, month: m - 1 };
 }
@@ -71,8 +86,8 @@ async function enqueueInvoiceClosed(userId, invoiceId, year, month, subtotal, cu
 }
 
 async function closeMonthOnce(year, month) {
-  const today = new Date();
-  const lockKey = `monthly-close:${year}-${String(month).padStart(2, "0")}-${today.getDate()}`;
+  const { day } = getLisbonDateParts();
+  const lockKey = `monthly-close:${year}-${String(month).padStart(2, "0")}-${day}`;
   const gotLock = await redis.set(lockKey, "1", { nx: true, ex: 60 * 60 });
   if (!gotLock) {
     console.log(`[monthlyClose] lock ativo ${year}-${month}, a ignorar duplicado.`);
