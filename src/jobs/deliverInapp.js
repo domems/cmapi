@@ -3,7 +3,7 @@ import { sql } from "../config/db.js";
 
 /** ---- Helpers de prefs ---- */
 async function channelInappEnabled(userId) {
-  // Se existir `channels` em user_notification_prefs, usa; senão default = ON
+  // Se existir `channels` em user_notification_prefs, usa; senão default = ON 
   const rows = await sql/*sql*/`
     SELECT channels
     FROM user_notification_prefs
